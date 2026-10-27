@@ -4,7 +4,7 @@ Code, fixed splits and results for the paper
 
 > **Plant-disease models learn the dataset, not the disease: diagnosing cross-source failure and
 > controlling treatment risk on unseen sources.**
-> Nafiul Islam, Fatima Alifa, Tanni, Abdullah Alif. Submitted to *Computers and Electronics in Agriculture*.
+> Nafiul Islam, Fatima Alifa, Tanni, Abdullah Alif, Dip Nandi. Submitted to *Computers and Electronics in Agriculture*.
 
 We study onion and potato leaf-disease recognition across **eight public datasets** (four per crop),
 always testing on a source the model has never seen (leave-one-dataset-out). We find that:
