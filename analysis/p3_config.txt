@@ -1,0 +1,84 @@
+##CELL code
+# ============================== CONFIG (potato) ==============================
+SMOKE = False               # True = tiny subset: checks the whole notebook in ~20 min
+MERGE_VIRAL = False         # (onion-only option; kept for the shared code)
+IMG_SIZE = 224
+CACHE_SIZE = 256
+EPOCHS = 15                 # fine-tuned baselines: same recipe as onion v1
+BATCH = 64
+SEEDS = [0, 1, 2]
+CV_FOLDS = 5
+VAL_FOLDS = 7
+DEDUP_HAMMING = 4
+MIN_CLASS_IMAGES = 20
+ALPHA = 0.10
+TIME_BUDGET_H = 11.0
+NUM_WORKERS = 8
+DATASETS = ["plantvillage", "plantdoc", "pld_pakistan", "uncontrolled_indonesia"]
+REGION = {"plantvillage": "USA (lab)", "plantdoc": "web (field photos)", "pld_pakistan": "Pakistan",
+          "uncontrolled_indonesia": "Indonesia"}
+EXTRA_SPLITS = [("plantvillage>plantdoc", ["plantvillage"], ["plantdoc"])]   # classic single-source reference
+
+# ---- frozen foundation encoders, multi-scale tiles, SERA heads (identical to onion v2) ----
+FM_ENCODERS = {
+    "DINOv3-B":  dict(kind="timm", name="vit_base_patch16_dinov3.lvd1689m"),
+    "DINOv3-S":  dict(kind="timm", name="vit_small_patch16_dinov3.lvd1689m"),
+    "BioCLIP-2": dict(kind="open_clip", name="hf-hub:imageomics/bioclip-2"),
+}
+MAIN_FM, EDGE_FM = "DINOv3-B", "DINOv3-S"
+TILE_GRIDS = (1, 2, 3)
+TILE_CANVAS = 672
+HEAD_SEEDS = list(range(10))
+INNER_SEEDS = [0, 1, 2]
+HEAD_EPOCHS = 40
+HEAD_BATCH = 256
+TILE_DROP = 0.25
+KNN_K = 10
+RISK_EPS = 0.05
+MATCHED_ACCEPT = (0.3, 0.5)
+FT_MODELS = ["ConvNeXtT", "ViTS", "EfficientNetB0"]
+FT_GATE_MODELS = ["ViTS"]   # trained first on LODO + all leave-one-source-out splits (with kNN distances) for the gate
+FT_GATE_SEEDS = [0, 1, 2]   # v4: every seed of the gate model also gets its leave-one-source-out runs
+DG_MODELS = ["DG:MixStyle", "DG:SWA"]   # v4: domain-generalization baselines (EfficientNet-B0, v1 recipe), len(SEEDS) seeds
+LCO_CALIBRATION = True      # v4: leave-one-class-out versions of the inner splits (unseen-disease simulation for the gate)
+XAI_SAMPLES = 64
+AUDIT_PER_CELL = 20
+EXTERNAL_NAME = "potato_external"
+
+CROP = "potato"
+REMEDY_GROUP = {   # diseases that share the same management action
+    "healthy": "none", "early_blight": "fungal_foliar", "fungi_other": "fungal_foliar",
+    "late_blight": "oomycete", "bacterial": "bacterial", "viral": "vector_control",
+    "pest": "pest_control", "nematode": "nematode_control",
+}
+ACTION = {   # advice templates (UNVERIFIED; agronomists must check them before any field use)
+    "none": "No disease detected. Keep routine scouting and balanced fertilization.",
+    "fungal_foliar": "Early blight / fungal leaf spot: remove infected lower leaves, avoid overhead irrigation, balanced nitrogen, rotate crops; protectant fungicide per local guideline.",
+    "oomycete": "Late blight (urgent, spreads fast): remove and destroy infected plants, avoid leaf wetness, use certified seed tubers; late-blight fungicide programme per local guideline; warn neighbouring growers.",
+    "bacterial": "Bacterial disease: use certified seed, avoid working in wet fields, remove infected plants; copper products only where the local guideline allows.",
+    "vector_control": "Viral disease: no cure. Control aphid/whitefly vectors, rogue infected plants, use certified virus-free seed.",
+    "pest_control": "Insect/mite damage: confirm the pest, apply threshold-based IPM (scouting, natural enemies, selective insecticide only if needed).",
+    "nematode_control": "Nematodes: confirm with a soil test; rotate with non-host crops, use resistant varieties and clean seed.",
+}
+
+import os
+from pathlib import Path
+RUN_FT_BASELINES = os.environ.get("ONION_SKIP_FT", "0") != "1"
+OUT = Path(os.environ.get("ONION_OUT", "/kaggle/working"))
+INPUT_ROOT = Path(os.environ.get("ONION_INPUT", "/kaggle/input"))
+CACHE_DIR = Path(os.environ.get("ONION_CACHE", "/tmp/potato_cache"))
+PRETRAINED = os.environ.get("ONION_PRETRAINED", "1") == "1"
+RES = OUT / "results"
+RUNS, WEIGHTS, FIGS, TABLES = RES / "runs", RES / "weights", RES / "figures", RES / "tables"
+FEATS = RES / "features"
+HEADS = RES / "heads"
+for p in (RUNS, WEIGHTS, FIGS, TABLES, FEATS, HEADS, CACHE_DIR):
+    p.mkdir(parents=True, exist_ok=True)
+
+if SMOKE:
+    EPOCHS, SEEDS, CV_FOLDS, XAI_SAMPLES, AUDIT_PER_CELL = 1, [0], 2, 8, 3
+    HEAD_SEEDS, INNER_SEEDS, HEAD_EPOCHS, FT_GATE_SEEDS = [0, 1], [0], 6, [0]
+    SMOKE_PER_CLASS = 24
+    if os.environ.get("ONION_SMOKE_FMS"):
+        FM_ENCODERS = {k: v for k, v in FM_ENCODERS.items() if k in os.environ["ONION_SMOKE_FMS"].split(",")}
+print("SMOKE" if SMOKE else "FULL", "run | crop:", CROP, "| output ->", RES, "| encoders:", list(FM_ENCODERS))

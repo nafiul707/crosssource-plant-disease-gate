@@ -1,0 +1,7 @@
+# Local scripts only (paper/ and analysis/). The Kaggle notebooks install what they need themselves.
+numpy>=2.0
+pandas>=2.2
+matplotlib>=3.9
+Pillow>=10.0
+tqdm>=4.66
+torch>=2.3        # analysis/analysis_local.py only (CPU is enough)

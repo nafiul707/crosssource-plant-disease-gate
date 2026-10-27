@@ -1,0 +1,28 @@
+target,subset,features,probe,balanced_acc,chance
+source,all images,raw,linear,0.9927371816117954,0.25
+source,all images,raw,MLP,0.993656179117564,0.25
+source,within early_blight,raw,linear,0.9993722536095418,0.3333333333333333
+source,within early_blight,raw,MLP,0.9995815024063611,0.3333333333333333
+source,within healthy,raw,linear,0.9973107593409917,0.3333333333333333
+source,within healthy,raw,MLP,0.9996619337390129,0.3333333333333333
+source,within late_blight,raw,linear,0.9862508795129957,0.25
+source,within late_blight,raw,MLP,0.9908975606815906,0.25
+disease,all images,raw,linear,0.8673528692391592,0.125
+source,all images,class-cond. LEACE,linear,0.5199028756978226,0.25
+source,all images,class-cond. LEACE,MLP,0.9805806602980067,0.25
+source,within early_blight,class-cond. LEACE,linear,0.9155349594954115,0.3333333333333333
+source,within early_blight,class-cond. LEACE,MLP,0.9614876393746451,0.3333333333333333
+source,within healthy,class-cond. LEACE,linear,0.9811753153869415,0.3333333333333333
+source,within healthy,class-cond. LEACE,MLP,0.9929617662348252,0.3333333333333333
+source,within late_blight,class-cond. LEACE,linear,0.8787577124233183,0.25
+source,within late_blight,class-cond. LEACE,MLP,0.9550725999180629,0.25
+disease,all images,class-cond. LEACE,linear,0.8618032482819961,0.125
+source,all images,global LEACE,linear,0.27370747833219766,0.25
+source,all images,global LEACE,MLP,0.9762529951082717,0.25
+source,within early_blight,global LEACE,linear,0.9024368218097031,0.3333333333333333
+source,within early_blight,global LEACE,MLP,0.9621543060413117,0.3333333333333333
+source,within healthy,global LEACE,linear,0.9915942117619879,0.3333333333333333
+source,within healthy,global LEACE,MLP,0.992781891915719,0.3333333333333333
+source,within late_blight,global LEACE,linear,0.886882238464491,0.25
+source,within late_blight,global LEACE,MLP,0.9462450689570926,0.25
+disease,all images,global LEACE,linear,0.850428142049168,0.125

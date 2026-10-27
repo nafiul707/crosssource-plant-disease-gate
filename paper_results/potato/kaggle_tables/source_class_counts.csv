@@ -1,0 +1,16 @@
+dataset,source_class,images,folders
+plantvillage,Potato___Early_blight,1000,2
+plantvillage,Potato___Late_blight,1000,2
+plantvillage,Potato___healthy,152,2
+plantdoc,Potato_leaf_early_blight,171,2
+plantdoc,Potato_leaf_late_blight,208,2
+pld_pakistan,Early_Blight,1628,3
+pld_pakistan,Healthy,1020,3
+pld_pakistan,Late_Blight,1424,3
+uncontrolled_indonesia,Bacteria,569,1
+uncontrolled_indonesia,Fungi,748,1
+uncontrolled_indonesia,Healthy,201,1
+uncontrolled_indonesia,Nematode,68,1
+uncontrolled_indonesia,Pest,611,1
+uncontrolled_indonesia,Phytopthora,347,1
+uncontrolled_indonesia,Virus,532,1

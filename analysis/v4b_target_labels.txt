@@ -1,0 +1,67 @@
+##CELL md
+### 12.3 What if a few images of the new source are labelled? (target-labelled calibration)
+The obvious alternative to our label-free gate: label *n* images of the new source (e.g. by an extension officer) and calibrate on those (standard CRC, valid under exchangeability *within* the new source; Xiang et al. 2026 "Setting B"). For each held-out source and seed we draw *n* ∈ {25, 50, 100, 200, 400} images (whole photo groups), calibrate on them, and test on the rest of that source; 200 random draws. The leave-one-source-out gate (no target labels) is evaluated on exactly the same remaining images. Reported: mean risk, mean acceptance, and **P(risk > ε)**, the chance that a farm's calibration sample gives a gate that breaks the target.
+##CELL code
+N_TARGET = [25, 50, 100, 200, 400]
+N_DRAWS = 20 if SMOKE else 200
+TL_SCORE = "Remedy+kNN"
+TL = []
+rng_tl = np.random.default_rng(0)
+for m in tqdm(ROB_MODELS, desc="target-labelled calibration"):
+    for h in dss:
+        for s in ALL_SEEDS:
+            r = load_any(m, "lodo", h, s)
+            if r is None:
+                continue
+            cal = [view_of(m, "inner", f"{h}|{s2}", s) for s2 in dss if s2 != h]
+            if not cal or any(v is None for v in cal):
+                continue
+            dv = add_energy(decision_view(r, "lodo"), r)
+            if TL_SCORE not in dv["U"] or not all(TL_SCORE in v["U"] for v in cal):
+                continue
+            ut, wrong = dv["U"][TL_SCORE][1], dv["wrong_t"]
+            _, ginv = np.unique(idx.group.values[r["test_idx"]], return_inverse=True)
+            members = [np.where(ginv == g)[0] for g in range(ginv.max() + 1)]
+            grid = np.unique(np.concatenate([[0.0, 1.0], ut] + [v["U"][TL_SCORE][1] for v in cal]))
+            b_src = [crc_curve(v["U"][TL_SCORE][1], v["wrong_t"], grid) for v in cal]
+            for eps in (0.05, 0.10):
+                lam_fixed = {"LOSO-CRC": pick(grid, np.mean(b_src, 0), eps), "LOSO-CRC-worst": pick(grid, np.max(b_src, 0), eps)}
+                for n in N_TARGET:
+                    if n > len(ut) // 2:
+                        continue
+                    for d in range(N_DRAWS):
+                        take, cnt = [], 0
+                        for g in rng_tl.permutation(len(members)):
+                            take.append(members[g]); cnt += len(members[g])
+                            if cnt >= n:
+                                break
+                        ci = np.concatenate(take); rest = np.ones(len(ut), bool); rest[ci] = False
+                        lams = dict(lam_fixed, **{f"target-CRC": pick(grid, crc_curve(ut[ci], wrong[ci], grid), eps)})
+                        for name, lam in lams.items():
+                            acc = ut[rest] <= lam
+                            TL.append((m, h, s, eps, n, d, name, acc.mean(), (acc & wrong[rest]).mean()))
+TL = pd.DataFrame(TL, columns=["model", "held_out", "seed", "eps", "n", "draw", "calibration", "accept", "risk"])
+if len(TL):
+    TL["violation"] = (TL.risk > TL.eps).astype(float)
+    TL.to_csv(TABLES / "gate_target_labelled_all.csv.gz", index=False)
+    TLA = (TL.groupby(["model", "calibration", "eps", "n", "held_out"])[["risk", "accept", "violation"]].mean()
+             .groupby(["model", "calibration", "eps", "n"]).mean().reset_index())
+    TLA.to_csv(TABLES / "gate_target_labelled.csv", index=False)
+    for eps in (0.05, 0.10):
+        sub = TLA[TLA.eps == eps].copy()
+        sub["cell"] = [f"{r:.3f} / {a:.2f} / {v:.2f}" for r, a, v in zip(sub.risk, sub.accept, sub.violation)]
+        piv = sub.pivot_table(index=["model", "calibration"], columns="n", values="cell", aggfunc="first")
+        piv.columns = [f"n={c}" for c in piv.columns]
+        report(f"RQ3c - label n images of the new source vs label-free LOSO gate ({TL_SCORE}, eps = {eps:.0%}): "
+               "risk / acceptance / P(risk > eps)", md_table(piv))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    for m in ROB_MODELS:
+        for cal, ls in (("target-CRC", "-"), ("LOSO-CRC-worst", "--")):
+            d_ = TLA[(TLA.model == m) & (TLA.calibration == cal) & (TLA.eps == 0.05)].sort_values("n")
+            if len(d_):
+                axes[0].plot(d_.n, d_.violation, ls, marker="o", label=f"{m} / {cal}")
+                axes[1].plot(d_.n, d_.accept, ls, marker="o", label=f"{m} / {cal}")
+    axes[0].set_xscale("log"); axes[1].set_xscale("log")
+    axes[0].set_xlabel("labelled images from the new source (n)"); axes[0].set_ylabel("P(risk > 5%)")
+    axes[1].set_xlabel("labelled images from the new source (n)"); axes[1].set_ylabel("acceptance")
+    axes[0].legend(fontsize=6); plt.tight_layout(); plt.savefig(FIGS / "rq3c_target_labels.png", dpi=120); plt.show()

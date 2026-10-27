@@ -1,0 +1,131 @@
+##CELL code
+# ============================== CONFIG ==============================
+SMOKE = False               # True = tiny subset: checks the whole notebook in ~20 min
+MERGE_VIRAL = True          # COLD Iris_yellow_virus + TOM2024 Virosis-D -> "viral" (section 6 tests whether they agree)
+IMG_SIZE = 224
+CACHE_SIZE = 256            # RAM cache (dedup + fine-tuned baselines), as in v1
+EPOCHS = 15                 # fine-tuned baselines; kept equal to v1 so v1 runs are reused
+BATCH = 64
+SEEDS = [0, 1, 2]           # seeds for fine-tuned baselines
+CV_FOLDS = 5
+VAL_FOLDS = 7               # inner validation = 1/7 of the training pool (groups kept intact)
+DEDUP_HAMMING = 4
+MIN_CLASS_IMAGES = 20
+ALPHA = 0.10                # conformal miscoverage for the v1-style remedy-set gate (continuity)
+TIME_BUDGET_H = 11.0        # no new fine-tuning run is started after this many hours
+NUM_WORKERS = 8
+DATASETS = ["cold", "tom2024_onion", "roboflow_capstone", "roboflow_onionnet"]
+REGION = {"cold": "India", "tom2024_onion": "Burkina Faso",
+          "roboflow_capstone": "unknown", "roboflow_onionnet": "unknown"}
+
+# ---- v2: frozen foundation encoders, multi-scale tiles, SERA heads ----
+FM_ENCODERS = {             # all are run in ONE pass over the images
+    "DINOv3-B":  dict(kind="timm", name="vit_base_patch16_dinov3.lvd1689m"),
+    "DINOv3-S":  dict(kind="timm", name="vit_small_patch16_dinov3.lvd1689m"),
+    "BioCLIP-2": dict(kind="open_clip", name="hf-hub:imageomics/bioclip-2"),
+}
+MAIN_FM, EDGE_FM = "DINOv3-B", "DINOv3-S"   # headline encoder / phone-sized encoder
+TILE_GRIDS = (1, 2, 3)      # 1 global view + 2x2 + 3x3 tiles = 14 views per image
+TILE_CANVAS = 672           # image -> 672x672 (same squash as v1's cache), then tiled; each tile -> 224x224
+HEAD_SEEDS = list(range(10))
+INNER_SEEDS = [0, 1, 2]     # seeds for leave-one-source-out (gate calibration) and external runs
+HEAD_EPOCHS = 40
+HEAD_BATCH = 256
+TILE_DROP = 0.25            # tile dropout while training the pooling heads
+KNN_K = 10
+RISK_EPS = 0.05             # gate target: wrong remedies issued <= 5% of all images
+MATCHED_ACCEPT = (0.3, 0.5) # acceptance levels for matched comparisons of risk scores
+FT_MODELS = ["ConvNeXtT", "ViTS", "EfficientNetB0"]   # fine-tuned baselines to complete to len(SEEDS) seeds
+# v2.1: the best fine-tuned model, retrained with the same recipe but also storing kNN feature distances, on LODO and on
+# all leave-one-source-out splits (seed 0) -> the risk-controlled gate can be calibrated on it (v2 had no inner runs for it)
+FT_GATE_MODELS = ["ViTS-kNN"]
+FT_GATE_SEEDS = [0, 1, 2]   # v4: every seed of the gate model also gets its leave-one-source-out runs
+DG_MODELS = ["DG:MixStyle", "DG:SWA"]   # v4: domain-generalization baselines (EfficientNet-B0, v1 recipe), len(SEEDS) seeds
+LCO_CALIBRATION = True      # v4: leave-one-class-out versions of the inner splits (unseen-disease simulation for the gate)
+
+CROP = "onion"
+REMEDY_GROUP = {   # diseases that share the same management action
+    "healthy": "none", "purple_blotch": "fungal_foliar", "stemphylium": "fungal_foliar",
+    "botrytis": "fungal_foliar", "downy_mildew": "oomycete", "rust": "rust",
+    "viral": "vector_control", "iris_yellow_virus": "vector_control", "virosis": "vector_control",
+    "xanthomonas": "bacterial", "fusarium": "soilborne", "bulb_blight": "soilborne", "burn_tip": "abiotic_tip",
+}
+ACTION = {   # advice templates (UNVERIFIED; agronomists must check them before any field use)
+    "none": "No disease detected. Keep routine scouting and balanced fertilization.",
+    "fungal_foliar": "Leaf-blight complex (purple blotch / Stemphylium / Botrytis): remove infected leaves, avoid late-day overhead irrigation, improve airflow, rotate away from Allium; foliar fungicide programme per local guideline.",
+    "oomycete": "Downy mildew: improve drainage/airflow, avoid long leaf wetness, remove volunteer onions; oomycete-specific fungicide per local guideline.",
+    "rust": "Rust: remove infected debris and volunteer Allium, balanced nitrogen; rust-labelled fungicide per local guideline.",
+    "vector_control": "Viral (e.g. Iris yellow spot virus): no cure. Manage thrips (monitoring, sticky traps, insecticide rotation), rogue infected plants, control weeds.",
+    "bacterial": "Bacterial leaf blight: clean seed/sets, avoid working in wet fields, reduce leaf wetness; copper bactericide where the local guideline allows.",
+    "soilborne": "Soil/bulb disease (Fusarium basal rot / bulb blight): long rotation, healthy treated sets, good drainage, careful curing and storage.",
+    "abiotic_tip": "Tip burn: check water stress, salinity, nutrients; rule out Botrytis before spraying.",
+}
+XAI_SAMPLES = 64            # images per held-out set for the attention figure / mask metrics
+AUDIT_PER_CELL = 20         # images per (source, class) in the expert label-audit pack
+EXTERNAL_NAME = "onion_external"
+
+import os
+from pathlib import Path
+RUN_FT_BASELINES = os.environ.get("ONION_SKIP_FT", "0") != "1"
+OUT = Path(os.environ.get("ONION_OUT", "/kaggle/working"))
+INPUT_ROOT = Path(os.environ.get("ONION_INPUT", "/kaggle/input"))
+CACHE_DIR = Path(os.environ.get("ONION_CACHE", "/tmp/onion_cache"))   # not saved as output
+PRETRAINED = os.environ.get("ONION_PRETRAINED", "1") == "1"
+RES = OUT / "results"
+RUNS, WEIGHTS, FIGS, TABLES = RES / "runs", RES / "weights", RES / "figures", RES / "tables"
+FEATS = RES / "features"    # cached multi-scale tile features (+ acquisition metadata)
+HEADS = RES / "heads"       # SERA / probe head runs (logits, kNN scores, attention)
+for p in (RUNS, WEIGHTS, FIGS, TABLES, FEATS, HEADS, CACHE_DIR):
+    p.mkdir(parents=True, exist_ok=True)
+
+if SMOKE:
+    EPOCHS, SEEDS, CV_FOLDS, XAI_SAMPLES, AUDIT_PER_CELL = 1, [0], 2, 8, 3
+    HEAD_SEEDS, INNER_SEEDS, HEAD_EPOCHS, FT_GATE_SEEDS = [0, 1], [0], 6, [0]
+    SMOKE_PER_CLASS = 24    # images per (dataset, class)
+    if os.environ.get("ONION_SMOKE_FMS"):
+        FM_ENCODERS = {k: v for k, v in FM_ENCODERS.items() if k in os.environ["ONION_SMOKE_FMS"].split(",")}
+print("SMOKE" if SMOKE else "FULL", "run | output ->", RES, "| encoders:", list(FM_ENCODERS))
+##CELL code
+import importlib.metadata as _md, subprocess, sys
+def _ver(pkg):
+    try:
+        return tuple(int(x) for x in _md.version(pkg).split(".")[:3] if x.isdigit())
+    except Exception:
+        return None
+_need = []
+if (_ver("timm") or (0,)) < (1, 0, 20):
+    _need.append("timm>=1.0.20")          # DINOv3 needs timm >= 1.0.20
+if any(v["kind"] == "open_clip" for v in FM_ENCODERS.values()) and _ver("open_clip_torch") is None:
+    _need.append("open_clip_torch")
+if _ver("onnxscript") is None:
+    _need.append("onnxscript")            # ONNX export of DINOv3 (torch.export path)
+if _need:
+    print("installing:", _need)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", *_need], check=False)
+print("timm", _md.version("timm") if _ver("timm") else "missing",
+      "| open_clip", _md.version("open_clip_torch") if _ver("open_clip_torch") else "missing")
+##CELL code
+def resume_previous():
+    """Copy finished runs (v1 fine-tuned baselines, v2 heads) and cached tile features from attached outputs.
+    v1 model weights are NOT copied (not needed in v2; saves several GB)."""
+    n = 0
+    if not INPUT_ROOT.exists():
+        return 0
+    for runs_dir in INPUT_ROOT.rglob("results/runs"):
+        if runs_dir.resolve() == RUNS.resolve():
+            continue
+        for f in runs_dir.iterdir():
+            if not (RUNS / f.name).exists():
+                shutil.copy2(f, RUNS / f.name); n += 1
+        for sub, dst in (("features", FEATS), ("heads", HEADS)):
+            sdir = runs_dir.parent / sub
+            if sdir.exists():
+                for f in sdir.iterdir():
+                    if sub == "features" and not f.name.startswith(("tiles_", "acqmeta_")):
+                        continue                       # v1 global features are not used
+                    if not (dst / f.name).exists():
+                        shutil.copy2(f, dst / f.name); n += 1
+        print("resumed from", runs_dir.parent)
+    return n
+
+print("files resumed:", resume_previous())

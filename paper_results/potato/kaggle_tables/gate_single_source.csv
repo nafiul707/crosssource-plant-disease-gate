@@ -1,0 +1,55 @@
+model,proto,held_out,seed,score,calibration,lam,accept,accept_id,risk,violation,wrong_among_issued,withheld_unseen,n
+LP-global@DINOv3-B,single,plantvillage>plantdoc,0,-,no gate,,1.0,1.0,0.7828418230563002,1.0,0.7828418230563002,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,0,Remedy-set,CP-remedy(val),,0.514745308310992,0.514745308310992,0.4155495978552279,1.0,0.8072916666666666,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,0,MSP,val-CRC,1.0,1.0,1.0,0.7828418230563002,1.0,0.7828418230563002,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,0,Remedy,val-CRC,1.0,1.0,1.0,0.7828418230563002,1.0,0.7828418230563002,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,0,kNN,val-CRC,1.0,1.0,1.0,0.7828418230563002,1.0,0.7828418230563002,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,0,Remedy+kNN,val-CRC,1.0,1.0,1.0,0.7828418230563002,1.0,0.7828418230563002,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,1,-,no gate,,1.0,1.0,0.6970509383378016,1.0,0.6970509383378016,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,1,Remedy-set,CP-remedy(val),,0.4289544235924933,0.4289544235924933,0.2868632707774799,1.0,0.66875,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,1,MSP,val-CRC,1.0,1.0,1.0,0.6970509383378016,1.0,0.6970509383378016,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,1,Remedy,val-CRC,1.0,1.0,1.0,0.6970509383378016,1.0,0.6970509383378016,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,1,kNN,val-CRC,1.0,1.0,1.0,0.6970509383378016,1.0,0.6970509383378016,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,1,Remedy+kNN,val-CRC,1.0,1.0,1.0,0.6970509383378016,1.0,0.6970509383378016,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,2,-,no gate,,1.0,1.0,0.7158176943699732,1.0,0.7158176943699732,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,2,Remedy-set,CP-remedy(val),,0.46648793565683644,0.46648793565683644,0.30563002680965146,1.0,0.6551724137931034,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,2,MSP,val-CRC,1.0,1.0,1.0,0.7158176943699732,1.0,0.7158176943699732,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,2,Remedy,val-CRC,1.0,1.0,1.0,0.7158176943699732,1.0,0.7158176943699732,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,2,kNN,val-CRC,1.0,1.0,1.0,0.7158176943699732,1.0,0.7158176943699732,,373
+LP-global@DINOv3-B,single,plantvillage>plantdoc,2,Remedy+kNN,val-CRC,1.0,1.0,1.0,0.7158176943699732,1.0,0.7158176943699732,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,0,-,no gate,,1.0,1.0,0.579088471849866,1.0,0.579088471849866,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,0,Remedy-set,CP-remedy(val),,0.2546916890080429,0.2546916890080429,0.10455764075067024,1.0,0.4105263157894737,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,0,MSP,val-CRC,1.0,1.0,1.0,0.579088471849866,1.0,0.579088471849866,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,0,Remedy,val-CRC,1.0,1.0,1.0,0.579088471849866,1.0,0.579088471849866,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,0,kNN,val-CRC,1.0,1.0,1.0,0.579088471849866,1.0,0.579088471849866,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,0,Remedy+kNN,val-CRC,1.0,1.0,1.0,0.579088471849866,1.0,0.579088471849866,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,1,-,no gate,,1.0,1.0,0.5603217158176944,1.0,0.5603217158176944,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,1,Remedy-set,CP-remedy(val),,0.32439678284182305,0.32439678284182305,0.21179624664879357,1.0,0.6528925619834711,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,1,MSP,val-CRC,1.0,1.0,1.0,0.5603217158176944,1.0,0.5603217158176944,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,1,Remedy,val-CRC,1.0,1.0,1.0,0.5603217158176944,1.0,0.5603217158176944,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,1,kNN,val-CRC,1.0,1.0,1.0,0.5603217158176944,1.0,0.5603217158176944,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,1,Remedy+kNN,val-CRC,1.0,1.0,1.0,0.5603217158176944,1.0,0.5603217158176944,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,2,-,no gate,,1.0,1.0,0.48257372654155495,1.0,0.48257372654155495,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,2,Remedy-set,CP-remedy(val),,0.27882037533512066,0.27882037533512066,0.08579088471849866,1.0,0.3076923076923077,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,2,MSP,val-CRC,1.0,1.0,1.0,0.48257372654155495,1.0,0.48257372654155495,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,2,Remedy,val-CRC,1.0,1.0,1.0,0.48257372654155495,1.0,0.48257372654155495,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,2,kNN,val-CRC,1.0,1.0,1.0,0.48257372654155495,1.0,0.48257372654155495,,373
+SERA@DINOv3-B,single,plantvillage>plantdoc,2,Remedy+kNN,val-CRC,1.0,1.0,1.0,0.48257372654155495,1.0,0.48257372654155495,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,0,-,no gate,,1.0,1.0,0.3780160857908847,1.0,0.3780160857908847,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,0,Remedy-set,CP-remedy(val),,0.42359249329758714,0.42359249329758714,0.13404825737265416,1.0,0.31645569620253167,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,0,MSP,val-CRC,1.0,1.0,1.0,0.3780160857908847,1.0,0.3780160857908847,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,0,Remedy,val-CRC,1.0,1.0,1.0,0.3780160857908847,1.0,0.3780160857908847,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,0,kNN,val-CRC,1.0,1.0,1.0,0.3780160857908847,1.0,0.3780160857908847,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,0,Remedy+kNN,val-CRC,1.0,1.0,1.0,0.3780160857908847,1.0,0.3780160857908847,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,1,-,no gate,,1.0,1.0,0.3378016085790885,1.0,0.3378016085790885,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,1,Remedy-set,CP-remedy(val),,0.8471849865951743,0.8471849865951743,0.257372654155496,1.0,0.3037974683544304,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,1,MSP,val-CRC,1.0,1.0,1.0,0.3378016085790885,1.0,0.3378016085790885,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,1,Remedy,val-CRC,1.0,1.0,1.0,0.3378016085790885,1.0,0.3378016085790885,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,1,kNN,val-CRC,1.0,1.0,1.0,0.3378016085790885,1.0,0.3378016085790885,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,1,Remedy+kNN,val-CRC,1.0,1.0,1.0,0.3378016085790885,1.0,0.3378016085790885,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,2,-,no gate,,1.0,1.0,0.5683646112600537,1.0,0.5683646112600537,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,2,Remedy-set,CP-remedy(val),,0.4879356568364611,0.4879356568364611,0.21447721179624665,1.0,0.43956043956043955,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,2,MSP,val-CRC,1.0,1.0,1.0,0.5683646112600537,1.0,0.5683646112600537,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,2,Remedy,val-CRC,1.0,1.0,1.0,0.5683646112600537,1.0,0.5683646112600537,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,2,kNN,val-CRC,1.0,1.0,1.0,0.5683646112600537,1.0,0.5683646112600537,,373
+SERA@DINOv3-S,single,plantvillage>plantdoc,2,Remedy+kNN,val-CRC,1.0,1.0,1.0,0.5683646112600537,1.0,0.5683646112600537,,373

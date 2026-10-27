@@ -1,0 +1,4 @@
+cls,raw,source-centred,pairs,verdict
+early_blight,0.11958144589637716,0.6646007833381494,6,consistent
+healthy,0.3312038294970989,0.3738578458627065,6,consistent
+late_blight,-0.05906860499332348,0.008433212836583456,12,style-shifted (consistent after centring)

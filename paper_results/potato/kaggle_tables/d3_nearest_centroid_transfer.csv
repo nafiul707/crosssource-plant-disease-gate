@@ -1,0 +1,21 @@
+space,train_src,test_src,shared,macro_f1,chance
+raw,plantdoc,plantvillage,"early_blight, late_blight",0.8357730276260952,0.5
+raw,pld_pakistan,plantvillage,"early_blight, healthy, late_blight",0.48312215750741877,0.3333333333333333
+raw,uncontrolled_indonesia,plantvillage,"healthy, late_blight",0.4613945378080619,0.5
+raw,plantvillage,plantdoc,"early_blight, late_blight",0.5883803959753326,0.5
+raw,pld_pakistan,plantdoc,"early_blight, late_blight",0.6312020613614573,0.5
+raw,plantvillage,pld_pakistan,"early_blight, healthy, late_blight",0.6447962891422395,0.3333333333333333
+raw,plantdoc,pld_pakistan,"early_blight, late_blight",0.5818689930786277,0.5
+raw,uncontrolled_indonesia,pld_pakistan,"healthy, late_blight",0.4988926586320499,0.5
+raw,plantvillage,uncontrolled_indonesia,"healthy, late_blight",0.4603980972613495,0.5
+raw,pld_pakistan,uncontrolled_indonesia,"healthy, late_blight",0.4435643145630247,0.5
+source-centred,plantdoc,plantvillage,"early_blight, late_blight",0.8329714524565348,0.5
+source-centred,pld_pakistan,plantvillage,"early_blight, healthy, late_blight",0.5382725048688075,0.3333333333333333
+source-centred,uncontrolled_indonesia,plantvillage,"healthy, late_blight",0.4439455688333218,0.5
+source-centred,plantvillage,plantdoc,"early_blight, late_blight",0.6391295558251024,0.5
+source-centred,pld_pakistan,plantdoc,"early_blight, late_blight",0.6359120046620047,0.5
+source-centred,plantvillage,pld_pakistan,"early_blight, healthy, late_blight",0.7164685774610843,0.3333333333333333
+source-centred,plantdoc,pld_pakistan,"early_blight, late_blight",0.7976577308421338,0.5
+source-centred,uncontrolled_indonesia,pld_pakistan,"healthy, late_blight",0.5720120331710961,0.5
+source-centred,plantvillage,uncontrolled_indonesia,"healthy, late_blight",0.5743518264812983,0.5
+source-centred,pld_pakistan,uncontrolled_indonesia,"healthy, late_blight",0.553274788286172,0.5

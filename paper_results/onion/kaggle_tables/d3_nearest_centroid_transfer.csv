@@ -1,0 +1,25 @@
+space,train_src,test_src,shared,macro_f1,chance
+raw,tom2024_onion,cold,"healthy, purple_blotch, viral",0.36142524255659686,0.3333333333333333
+raw,roboflow_capstone,cold,"healthy, purple_blotch, stemphylium",0.3410771040755764,0.3333333333333333
+raw,roboflow_onionnet,cold,"healthy, purple_blotch",0.5727155727155727,0.5
+raw,cold,tom2024_onion,"healthy, purple_blotch, viral",0.5482467762901851,0.3333333333333333
+raw,roboflow_capstone,tom2024_onion,"healthy, purple_blotch",0.6957810525443509,0.5
+raw,roboflow_onionnet,tom2024_onion,"healthy, purple_blotch",0.9001543889074306,0.5
+raw,cold,roboflow_capstone,"healthy, purple_blotch, stemphylium",0.5406046263722466,0.3333333333333333
+raw,tom2024_onion,roboflow_capstone,"healthy, purple_blotch",0.9154859038834748,0.5
+raw,roboflow_onionnet,roboflow_capstone,"downy_mildew, healthy, purple_blotch",0.6152951127235466,0.3333333333333333
+raw,cold,roboflow_onionnet,"healthy, purple_blotch",0.6758000823504051,0.5
+raw,tom2024_onion,roboflow_onionnet,"healthy, purple_blotch",0.8221239661741955,0.5
+raw,roboflow_capstone,roboflow_onionnet,"downy_mildew, healthy, purple_blotch",0.522449229972356,0.3333333333333333
+source-centred,tom2024_onion,cold,"healthy, purple_blotch, viral",0.37430702055634596,0.3333333333333333
+source-centred,roboflow_capstone,cold,"healthy, purple_blotch, stemphylium",0.3402617679906283,0.3333333333333333
+source-centred,roboflow_onionnet,cold,"healthy, purple_blotch",0.48215028505713375,0.5
+source-centred,cold,tom2024_onion,"healthy, purple_blotch, viral",0.6349277855994111,0.3333333333333333
+source-centred,roboflow_capstone,tom2024_onion,"healthy, purple_blotch",0.857837888239859,0.5
+source-centred,roboflow_onionnet,tom2024_onion,"healthy, purple_blotch",0.9180913567668534,0.5
+source-centred,cold,roboflow_capstone,"healthy, purple_blotch, stemphylium",0.6080629185122465,0.3333333333333333
+source-centred,tom2024_onion,roboflow_capstone,"healthy, purple_blotch",0.9047619047619048,0.5
+source-centred,roboflow_onionnet,roboflow_capstone,"downy_mildew, healthy, purple_blotch",0.6292269343972864,0.3333333333333333
+source-centred,cold,roboflow_onionnet,"healthy, purple_blotch",0.8437724893686621,0.5
+source-centred,tom2024_onion,roboflow_onionnet,"healthy, purple_blotch",0.8324457457514001,0.5
+source-centred,roboflow_capstone,roboflow_onionnet,"downy_mildew, healthy, purple_blotch",0.5719815143185226,0.3333333333333333

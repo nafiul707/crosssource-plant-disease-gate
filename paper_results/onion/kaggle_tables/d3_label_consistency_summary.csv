@@ -1,0 +1,6 @@
+cls,raw,source-centred,pairs,verdict
+downy_mildew,0.30184877663850784,0.14999522548168898,2,consistent
+healthy,0.1581954206340015,0.46575456221277517,12,consistent
+purple_blotch,-0.07973258135219415,0.13927548681385815,12,style-shifted (consistent after centring)
+stemphylium,-0.37200942635536194,0.05248867720365524,2,style-shifted (consistent after centring)
+viral,-0.15803441032767296,0.1085127554833889,2,style-shifted (consistent after centring)

@@ -1,0 +1,1635 @@
+##CELL md
+## 6. Shared helpers: remedy groups, calibration, run files
+A farmer acts on a **treatment**, not on a disease name. Diseases that share one management action form one remedy group, so confusing them is harmless; confusing groups (e.g. viral → thrips control vs fungal → fungicide) is a **wrong remedy**.
+##CELL code
+import copy, gc
+from collections import deque
+
+# REMEDY_GROUP (disease -> management action group) and ACTION (group -> advice template) come from the config cell
+GROUPS = sorted(set(REMEDY_GROUP.values()))
+G2I = {g: i for i, g in enumerate(GROUPS)}
+CLASS_GROUP = np.array([G2I[REMEDY_GROUP[c]] for c in CLASSES])     # global class id -> remedy group id
+
+def batches(ix, bs):
+    for i in range(0, len(ix), bs):
+        yield ix[i:i + bs]
+
+def softmax(z, T=1.0):
+    z = z / T; z = z - z.max(1, keepdims=True); e = np.exp(z); return e / e.sum(1, keepdims=True)
+
+def fit_temperature(logits, y):
+    """Temperature scaling on the source validation split (bounded; rejected if it does not lower val NLL)."""
+    lg = torch.tensor(logits, dtype=torch.float64); yt = torch.tensor(y)
+    nll = lambda T: float(F.cross_entropy(lg / T, yt))
+    t = torch.zeros(1, dtype=torch.float64, requires_grad=True)
+    opt = torch.optim.LBFGS([t], lr=0.05, max_iter=100, line_search_fn="strong_wolfe")
+    def closure():
+        opt.zero_grad(); loss = F.cross_entropy(lg / t.clamp(-3, 3).exp(), yt); loss.backward(); return loss
+    try:
+        opt.step(closure); T = float(t.detach().clamp(-3, 3).exp())
+    except Exception:
+        T = 1.0
+    if not np.isfinite(T) or nll(T) > nll(1.0):
+        T = 1.0
+    return T
+
+def ece(p, y, bins=15):
+    conf, pred = p.max(1), p.argmax(1); e = 0.0
+    for lo, hi in zip(np.linspace(0, 1, bins + 1)[:-1], np.linspace(0, 1, bins + 1)[1:]):
+        m = (conf > lo) & (conf <= hi)
+        if m.any():
+            e += m.mean() * abs((pred[m] == y[m]).mean() - conf[m].mean())
+    return e
+
+def conf_quantile(scores, alpha):
+    n = len(scores)
+    if n == 0:
+        return 1.0
+    return float(np.quantile(scores, min(1.0, math.ceil((n + 1) * (1 - alpha)) / n), method="higher"))
+
+def aurc(conf, correct):
+    o = np.argsort(-conf); err = 1 - correct[o].astype(float)
+    return float(np.mean(np.cumsum(err) / np.arange(1, len(err) + 1))) if len(err) else np.nan
+
+def group_probs(p, classes):
+    """Disease probabilities (over the run's classes) -> remedy-group probabilities."""
+    M = np.zeros((len(classes), len(GROUPS)))
+    M[np.arange(len(classes)), CLASS_GROUP[classes]] = 1
+    return p @ M
+
+def cdf_of(ref, x):
+    """Empirical CDF of `ref` evaluated at x: turns any risk score into 'validation-quantile units'."""
+    r = np.sort(np.asarray(ref))
+    return np.searchsorted(r, x, side="right") / max(1, len(r))
+
+def f1_per_class_np(y, p, labels):
+    labels = np.asarray(labels)
+    top = int(max(y.max(initial=0), p.max(initial=0), labels.max(initial=0))) + 1
+    pos = np.full(top + 1, len(labels)); pos[labels] = np.arange(len(labels))
+    n = len(labels) + 1
+    cm = np.bincount(pos[y] * n + pos[p], minlength=n * n).reshape(n, n)
+    tp = np.diag(cm)[:-1]; fp = cm[:, :-1].sum(0) - tp; fn = cm[:-1, :].sum(1) - tp
+    den = 2 * tp + fp + fn
+    return np.where(den > 0, 2 * tp / np.maximum(den, 1), 0.0)
+
+def f1_macro_np(y, p, labels):
+    """Fast macro-F1 (same definition as sklearn f1_score(labels=labels, average='macro'))."""
+    return float(f1_per_class_np(np.asarray(y), np.asarray(p), labels).mean()) if len(labels) else np.nan
+
+def holm(p):
+    p = np.asarray(p, dtype=float); o = np.argsort(p); adj = np.empty_like(p); run = 0.0
+    for r, i in enumerate(o):
+        run = max(run, min(1.0, (len(p) - r) * p[i])); adj[i] = run
+    return adj
+
+def run_key(model_name, proto, split, seed):
+    return re.sub(r"[^A-Za-z0-9_.+-]", "_", f"{model_name}__{proto}__{split}__s{seed}")
+
+def run_done(key):
+    """v1-format run (fine-tuned baselines): exists AND was made with the current splits/budget. Runs from v2 carry
+    RUN_TAG; untagged v1 runs count only if the attached v1 split signature equals ours (LEGACY_OK) and epochs match."""
+    f = RUNS / f"{key}.json"
+    if not f.exists() or not (RUNS / f"{key}.npz").exists():
+        return False
+    try:
+        j = json.loads(f.read_text())
+    except Exception:
+        return False
+    if "run_tag" in j:
+        return j["run_tag"] == RUN_TAG
+    return LEGACY_OK and j.get("epochs") == EPOCHS
+
+def uid_of(i):
+    return hashlib.md5(idx.rel[i].encode()).hexdigest()[:12]
+##CELL md
+## 7. Multi-scale tile features from frozen foundation encoders (one pass) + acquisition metadata
+Every image is resized to a 672×672 canvas (the same squash as v1's cache) and cut into **14 views**: the global view (= what v1 models saw), a 2×2 grid and a 3×3 grid, each resized to 224². All encoders read the same views in **one decoding pass**. Features (float16) are cached in `results/features` and reused on resume. The same pass records **acquisition metadata** (native resolution, file size, JPEG quantization step, sharpness, colour statistics) for the shortcut diagnosis.
+
+Why tiles: v1 showed that sources differ in *scale* (whole-plant photos with soil vs tight, often pixelated box crops). At 224² a lesion in a whole-plant photo covers a few pixels; the 3×3 tiles show it at roughly box-crop scale.
+##CELL code
+def tile_boxes(S=TILE_CANVAS, grids=TILE_GRIDS):
+    boxes, scale = [], []
+    for g in grids:
+        e = np.linspace(0, S, g + 1).round().astype(int)
+        for r in range(g):
+            for c in range(g):
+                boxes.append((int(e[c]), int(e[r]), int(e[c + 1]), int(e[r + 1]))); scale.append(g)
+    return boxes, np.array(scale)
+
+TILE_BOXES, TILE_SCALE = tile_boxes()
+N_TILES = len(TILE_BOXES)
+SCALE_IDX = torch.tensor([list(TILE_GRIDS).index(g) for g in TILE_SCALE])
+
+def load_tiles(path):
+    """Original file -> (N_TILES x 224 x 224 x 3 uint8 views, acquisition metadata)."""
+    raw = Path(path).read_bytes()
+    with Image.open(io.BytesIO(raw)) as im0:
+        fmt, (W0, H0) = im0.format, im0.size
+        q = float(np.mean(im0.quantization[0])) if fmt == "JPEG" and getattr(im0, "quantization", None) else np.nan
+        if fmt == "JPEG":
+            im0.draft("RGB", (2 * TILE_CANVAS, 2 * TILE_CANVAS))      # fast decode of large JPEGs
+        im = ImageOps.exif_transpose(im0).convert("RGB")
+    canvas = im.resize((TILE_CANVAS, TILE_CANVAS), Image.BILINEAR)
+    tiles = np.stack([np.asarray(canvas.crop(b).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)) for b in TILE_BOXES])
+    a = np.asarray(canvas.resize((256, 256), Image.BILINEAR), dtype=np.float32) / 255.0
+    gray = a @ np.array([0.299, 0.587, 0.114], np.float32)
+    lap = 4 * gray[1:-1, 1:-1] - gray[:-2, 1:-1] - gray[2:, 1:-1] - gray[1:-1, :-2] - gray[1:-1, 2:]
+    mx, mn = a.max(-1), a.min(-1)
+    meta_ = dict(native_long=max(W0, H0), native_short=min(W0, H0), file_kb=len(raw) / 1024,
+                 is_jpeg=float(fmt == "JPEG"), jpeg_qstep=q, sharpness=float(np.log(lap.var() + 1e-8)),
+                 brightness=float(gray.mean()), saturation=float(((mx - mn) / (mx + 1e-6)).mean()),
+                 green_frac=float(((a[..., 1] > a[..., 0]) & (a[..., 1] > a[..., 2])).mean()))
+    return tiles, meta_
+
+def count_params(m):
+    return sum(p.numel() for p in m.parameters()) / 1e6
+
+def load_encoder(spec):
+    if spec["kind"] == "timm":
+        m = timm.create_model(spec["name"], pretrained=PRETRAINED, num_classes=0, img_size=IMG_SIZE)
+        cfg = timm.data.resolve_data_config({}, model=m)
+        return m, cfg["mean"], cfg["std"], m
+    import open_clip
+    if not PRETRAINED:
+        raise RuntimeError("open_clip model needs pretrained weights (Internet)")
+    model, _, _ = open_clip.create_model_and_transforms(spec["name"])
+    enc = model.visual
+    class _Wrap(nn.Module):
+        def __init__(s, v): super().__init__(); s.v = v
+        def forward(s, x): return s.v(x)
+    return _Wrap(enc), open_clip.OPENAI_DATASET_MEAN, open_clip.OPENAI_DATASET_STD, enc
+##CELL code
+FM_PARAMS = {}
+
+@torch.no_grad()
+def extract_tiles(paths, n_rows, rows, tag):
+    """Run every encoder in FM_ENCODERS over the 14 views of each image (one decoding pass).
+    Writes FEATS/tiles_<encoder>_<tag>.npy (n_rows x N_TILES x D, float16; row = image row id) and
+    FEATS/acqmeta_<tag>.csv. Already-finished encoders are skipped (resume)."""
+    rows = np.asarray(rows)
+    files = {fm: FEATS / f"tiles_{fm}_{tag}.npy" for fm in FM_ENCODERS}
+    meta_f = FEATS / f"acqmeta_{tag}.csv"
+    todo = [fm for fm in FM_ENCODERS if not files[fm].exists()]
+    if todo or not meta_f.exists():
+        encs = {}
+        for fm in todo:
+            try:
+                enc, mean, std, counted = load_encoder(FM_ENCODERS[fm])
+                encs[fm] = (enc.to(DEVICE).eval(), torch.tensor(mean, device=DEVICE).view(1, 3, 1, 1),
+                            torch.tensor(std, device=DEVICE).view(1, 3, 1, 1), count_params(counted))
+            except Exception as e:
+                print(f"{fm}: encoder unavailable ({e}) -> skipped")
+        outs, tmp, metas = {}, {}, [None] * len(paths)
+        chunks = [list(range(i, min(i + 16, len(paths)))) for i in range(0, len(paths), 16)]
+        with ThreadPoolExecutor(NUM_WORKERS) as ex:
+            submit = lambda c: (c, [ex.submit(load_tiles, paths[j]) for j in c])
+            pending = deque(submit(c) for c in chunks[:6]); nxt = 6
+            for _ in tqdm(range(len(chunks)), desc=f"tiles {tag}"):
+                c, futs = pending.popleft()
+                if nxt < len(chunks):
+                    pending.append(submit(chunks[nxt])); nxt += 1
+                res = [f.result() for f in futs]
+                for j, (_, m_) in zip(c, res):
+                    metas[j] = m_
+                if not encs:
+                    continue
+                x = torch.from_numpy(np.stack([t for t, _ in res])).to(DEVICE)
+                x = x.flatten(0, 1).permute(0, 3, 1, 2).float() / 255.0          # (B*T) x 3 x 224 x 224
+                for fm, (enc, mean, std, _) in encs.items():
+                    with torch.autocast(DEVICE.type, dtype=torch.float16, enabled=AMP):
+                        z = torch.cat([enc((xb - mean) / std).float() for xb in x.split(112)])
+                    if not torch.isfinite(z).all():                            # fp16 overflow guard
+                        z = torch.cat([enc((xb - mean) / std).float() for xb in x.split(112)])
+                    z = z.view(len(c), N_TILES, -1).cpu().numpy().astype(np.float16)
+                    if fm not in outs:
+                        tmp[fm] = CACHE_DIR / f"tiles_{fm}_{tag}.npy"
+                        outs[fm] = np.lib.format.open_memmap(tmp[fm], mode="w+", dtype=np.float16,
+                                                             shape=(n_rows, N_TILES, z.shape[-1]))
+                    outs[fm][rows[c]] = z
+        names = list(outs)
+        for fm in names:
+            outs[fm].flush()
+        outs.clear(); gc.collect()
+        for fm in names:
+            shutil.move(str(tmp[fm]), str(files[fm]))
+            (FEATS / f"tiles_{fm}_{tag}.params.json").write_text(json.dumps({"params_m": encs[fm][3]}))
+        del encs; gc.collect(); torch.cuda.empty_cache()
+        pd.DataFrame(metas, index=pd.Index(rows, name="row")).to_csv(meta_f)
+    feats = {}
+    for fm in FM_ENCODERS:
+        if files[fm].exists():
+            feats[fm] = np.load(files[fm], mmap_mode="r")
+            pf = FEATS / f"tiles_{fm}_{tag}.params.json"
+            if pf.exists():
+                FM_PARAMS[fm] = json.loads(pf.read_text())["params_m"]
+    return feats, pd.read_csv(meta_f, index_col="row")
+##CELL md
+### 7.1 Extract (or reuse) features for the benchmark
+##CELL code
+ROWS = meta.index.values
+TILE_TAG = hashlib.md5(("".join(idx.rel) + f"|{TILE_GRIDS}|{TILE_CANVAS}|{IMG_SIZE}").encode()).hexdigest()[:10]
+TILE_FEATS, ACQ = extract_tiles(list(idx.path.values[ROWS]), len(idx), ROWS, TILE_TAG)
+FMS = [fm for fm in FM_ENCODERS if fm in TILE_FEATS]
+assert FMS, "no foundation encoder could be loaded (Internet on? timm >= 1.0.20?)"
+if MAIN_FM not in FMS:
+    print(f"WARNING: {MAIN_FM} unavailable -> using {FMS[0]} as the main encoder"); MAIN_FM = FMS[0]
+if EDGE_FM not in FMS:
+    EDGE_FM = MAIN_FM
+print("encoders:", {fm: TILE_FEATS[fm].shape for fm in FMS}, "| params (M):", FM_PARAMS, f"| {hours():.2f} h")
+##CELL md
+### 7.2 Optional external prospective test set (`onion_external/<class>/…`)
+Folders must be named with harmonized class names (`healthy`, `purple_blotch`, `stemphylium`, `downy_mildew`, `viral`, `botrytis`, `rust`, `xanthomonas`, `fusarium`, `bulb_blight`, `burn_tip`). External images are **never** used for training, calibration or model selection. Collect them yourself (new farms, new phones, both whole-plant and close-up shots of the same plant, GPS + date), not from the public sets.
+##CELL code
+def find_external():
+    if not INPUT_ROOT.exists():
+        return None
+    for p in INPUT_ROOT.rglob(EXTERNAL_NAME):
+        if p.is_dir() and any(c.is_dir() for c in p.iterdir()):
+            return p
+    return None
+
+EXT, EXT_FEATS = None, {}
+EXT_DIR = find_external()
+if EXT_DIR is not None:
+    rows_ = []
+    for cls_dir in sorted(d for d in EXT_DIR.iterdir() if d.is_dir()):
+        lab = cls_dir.name.strip().lower().replace(" ", "_").replace("-", "_")
+        for f in sorted(cls_dir.rglob("*")):
+            if f.suffix.lower() in IMG_EXTS:
+                rows_.append(dict(path=str(f), label_name=lab, rel=f"ext/{cls_dir.name}/{f.name}"))
+    EXT = pd.DataFrame(rows_)
+    bad_lab = sorted(set(EXT.label_name) - set(REMEDY_GROUP)) if len(EXT) else []
+    if bad_lab:
+        print("WARNING external classes not in the remedy table (dropped):", bad_lab)
+    EXT = EXT[EXT.label_name.isin(REMEDY_GROUP)].reset_index(drop=True) if len(EXT) else EXT
+    if len(EXT):
+        EXT["y"] = EXT.label_name.map(C2I).fillna(-1).astype(int)
+        EXT["g"] = EXT.label_name.map(lambda c: G2I[REMEDY_GROUP[c]])
+        ext_tag = "ext_" + hashlib.md5(("".join(EXT.rel) + TILE_TAG).encode()).hexdigest()[:10]
+        EXT_FEATS, EXT_ACQ = extract_tiles(list(EXT.path), len(EXT), np.arange(len(EXT)), ext_tag)
+        tr_all, va_all = inner_split(meta.index.values)
+        seen = list(set(meta.y[tr_all]))
+        SPLITS[("ext", "all")] = dict(train=tr_all, val=va_all, test=np.arange(len(EXT)),
+                                      test_id=np.where(np.isin(EXT.y, seen))[0],
+                                      test_ood=np.where(~np.isin(EXT.y, seen))[0])
+        report("External test set", md_table(EXT.label_name.value_counts().rename("images").to_frame(), "{:.0f}"))
+    else:
+        EXT = None
+print("external test set:", "none" if EXT is None else f"{len(EXT)} images from {EXT_DIR}")
+
+# optional single-source reference splits (e.g. the classic PlantVillage -> PlantDoc), from EXTRA_SPLITS in the config
+for name_, tr_src, te_src in globals().get("EXTRA_SPLITS", []):
+    pool = meta.index[meta.dataset.isin(tr_src)].values
+    test = meta.index[meta.dataset.isin(te_src)].values
+    if len(pool) == 0 or len(test) == 0:
+        continue
+    tr_, va_ = inner_split(pool)
+    seen = list(set(meta.y[tr_]))
+    va_ = va_[np.isin(meta.y[va_], seen)]
+    check_disjoint(tr_, va_, test)
+    SPLITS[("single", name_)] = dict(train=tr_, val=va_, test=test, test_id=test[np.isin(meta.y[test], seen)],
+                                     test_ood=test[~np.isin(meta.y[test], seen)])
+    print(f"single-source split {name_}: train {len(tr_)} | test {len(test)} ({len(SPLITS[('single', name_)]['test_id'])} seen classes)")
+
+# v4: leave-one-class-out (LCO) copies of every inner split, for the gate's calibration (section 12.2). Class c is removed
+# from the inner training/validation data, so the inner held-out source's images of c become an UNSEEN disease. This
+# simulates the case "new source with a disease no training source had", which plain leave-one-source-out cannot see
+# when all training sources share the same classes. Calibration only; never used for accuracy results.
+if globals().get("LCO_CALIBRATION", False):
+    for (_, sp_) in [k for k in SPLITS if k[0] == "inner"]:
+        S_ = SPLITS[("inner", sp_)]
+        y_tr_, y_va_, y_te_ = Y_ALL[S_["train"]].numpy(), Y_ALL[S_["val"]].numpy(), Y_ALL[S_["test"]].numpy()
+        for c in sorted(set(y_te_.tolist()) & set(y_tr_.tolist())):
+            tr_, va_ = S_["train"][y_tr_ != c], S_["val"][y_va_ != c]
+            seen = sorted(set(Y_ALL[tr_].tolist()))
+            if len(seen) < 2 or len(va_) == 0:
+                continue
+            SPLITS[("lco", f"{sp_}|{CLASSES[c]}")] = dict(train=tr_, val=va_, test=S_["test"],
+                                                         test_id=S_["test"][np.isin(y_te_, seen)],
+                                                         test_ood=S_["test"][~np.isin(y_te_, seen)])
+    print("leave-one-class-out calibration splits:", sum(k[0] == "lco" for k in SPLITS))
+
+def y_of(proto, ix):
+    """Global class ids of test rows (-1 = external class not in the benchmark)."""
+    return EXT.y.values[np.asarray(ix)] if proto == "ext" else Y_ALL[np.asarray(ix)].numpy()
+
+def g_of(proto, ix):
+    """True remedy group of test rows."""
+    return EXT.g.values[np.asarray(ix)] if proto == "ext" else CLASS_GROUP[Y_ALL[np.asarray(ix)].numpy()]
+##CELL md
+## 8. Diagnosis (RQ1): shortcut, label disagreement, or both?
+- **D1, acquisition metadata only** (no pixels of the leaf): can a gradient-boosted tree tell the *source* from native resolution, file size, JPEG quantization, sharpness and colour statistics? And *within* a source, can it tell the *disease*? (If yes, the source has a class-correlated acquisition shortcut.)
+- **D2, foundation features**: source identifiability of the DINOv3 global embedding, overall and **within a class** (healthy / purple blotch occur in ≥ 3 sources). Measured raw, after **class-conditional LEACE** and after plain (global) LEACE, with a linear and a non-linear (MLP) probe. A sanity check makes sure disease information survives erasure.
+- **D3, label-consistency index (LCI)**: for a class *c* shared by sources A and B, LCI = cos(centroid of *c* in A, centroid of *c* in B) − max over other classes *c′* of cos(*c* in A, *c′* in B). LCI > 0 means "*c* in A looks more like *c* in B than like anything else in B". We compute it raw and after **per-source centring** (which removes a global style offset). If LCI stays ≤ 0 after centring, the two sources' labels with the same name do not describe the same visual concept. That is an *annotation/taxonomy* problem that no model can fix. Then the blinded expert audit (section 15) decides.
+
+All probes: stratified **group** CV (photo groups never split), class-balanced loss, **balanced accuracy** (chance = 1/number of targets).
+##CELL code
+class Eraser:
+    """LEACE (Belrose et al., NeurIPS 2023): closed-form erasure of all LINEARLY available information about a
+    categorical concept z (here: the acquisition source) from features x, with minimal change to x:
+        r(x) = x - W^+ P W (x - mu),  W = Sigma_xx^{-1/2},  P = projection onto colspace(W Sigma_xz).
+    y given -> CLASS-CONDITIONAL: Sigma_xx and Sigma_xz are pooled within classes (x and z centred per class), so
+    only source information that is NOT explained by the class mix is removed (the class mix differs by source)."""
+    def __init__(self, X, z, y=None, shrink=1e-3):
+        dev = X.device
+        X = X.double(); z = z.long().to(dev)
+        Z = F.one_hot(z, int(z.max()) + 1).double()
+        Xc, Zc = X - X.mean(0), Z - Z.mean(0)
+        if y is not None:
+            y = y.to(dev)
+            for c in torch.unique(y):
+                m = y == c
+                Xc[m] = X[m] - X[m].mean(0); Zc[m] = Z[m] - Z[m].mean(0)
+        n, D = X.shape
+        Sxx = Xc.T @ Xc / n
+        Sxx += shrink * Sxx.diagonal().mean() * torch.eye(D, dtype=Sxx.dtype, device=dev)
+        Sxz = Xc.T @ Zc / n
+        del Xc, Zc
+        ev, V = torch.linalg.eigh(Sxx); ev = ev.clamp(min=float(ev.max()) * 1e-9)
+        W = (V * ev.rsqrt()) @ V.T; Winv = (V * ev.sqrt()) @ V.T
+        U, s, _ = torch.linalg.svd(W @ Sxz, full_matrices=False)
+        U = U[:, s > s.max() * 1e-6] if s.numel() and float(s.max()) > 0 else U[:, :0]
+        self.rank = int(U.shape[1])
+        self.M = (Winv @ U @ U.T @ W).float()
+        self.mu = X.mean(0).float()
+
+    def __call__(self, X):
+        sh = X.shape; X2 = X.reshape(-1, sh[-1]).float()
+        return (X2 - (X2 - self.mu) @ self.M.T).reshape(sh)
+
+def torch_probe(Xtr, ytr, Xte, hidden=0, steps=300, wd=1e-3, seed=0):
+    """Class-balanced multinomial logistic regression (hidden=0) or 1-hidden-layer MLP; full-batch AdamW."""
+    ytr = np.asarray(ytr)
+    cls, yi = np.unique(ytr, return_inverse=True)
+    if len(cls) < 2:
+        return np.full(len(Xte), cls[0] if len(cls) else None, dtype=object)
+    torch.manual_seed(seed)
+    Xtr = torch.as_tensor(np.asarray(Xtr), dtype=torch.float32, device=DEVICE)
+    Xte = torch.as_tensor(np.asarray(Xte), dtype=torch.float32, device=DEVICE)
+    mu, sd = Xtr.mean(0), Xtr.std(0) + 1e-6
+    Xtr, Xte = (Xtr - mu) / sd, (Xte - mu) / sd
+    yt = torch.tensor(yi, device=DEVICE)
+    w = torch.tensor(len(yi) / (len(cls) * np.bincount(yi)), dtype=torch.float32, device=DEVICE)
+    D = Xtr.shape[1]
+    net = (nn.Linear(D, len(cls)) if hidden == 0 else
+           nn.Sequential(nn.Linear(D, hidden), nn.GELU(), nn.Dropout(0.2), nn.Linear(hidden, len(cls)))).to(DEVICE)
+    opt = torch.optim.AdamW(net.parameters(), lr=1e-2 if hidden == 0 else 3e-3, weight_decay=wd)
+    net.train()
+    for _ in range(steps):
+        loss = F.cross_entropy(net(Xtr), yt, weight=w); opt.zero_grad(); loss.backward(); opt.step()
+    net.eval()
+    with torch.no_grad():
+        return cls[net(Xte).argmax(1).cpu().numpy()]
+
+def bacc(y, p):
+    from sklearn.metrics import balanced_accuracy_score
+    m = np.array([v is not None for v in p])
+    return balanced_accuracy_score(np.asarray(y)[m].astype(str), np.asarray(p)[m].astype(str)) if m.any() else np.nan
+
+D_SRC = idx.dataset.values[ROWS]; D_LAB = idx.label_name.values[ROWS]; D_GRP = idx.group.values[ROWS]
+D_STRAT = pd.Series(D_SRC + "|" + D_LAB).astype("category").cat.codes.values
+D_FOLDS = list(StratifiedGroupKFold(n_splits=CV_FOLDS, shuffle=True, random_state=0).split(ROWS, D_STRAT, D_GRP))
+SHARED3 = [c for c in CLASSES if meta[meta.label_name == c].dataset.nunique() >= min(3, len(dss))]
+print("classes in >= 3 sources:", SHARED3)
+##CELL md
+### 8.1 D1: acquisition metadata (no leaf pixels)
+##CELL code
+from sklearn.ensemble import HistGradientBoostingClassifier
+
+AM = ACQ.loc[ROWS].copy()
+AM["log_long"], AM["log_short"] = np.log(AM.native_long), np.log(AM.native_short)
+AM["aspect"] = AM.native_long / AM.native_short
+AM["log_kb"] = np.log(AM.file_kb)
+AM["jpeg_qstep"] = AM.jpeg_qstep.fillna(-1)
+MCOLS = ["log_long", "log_short", "aspect", "log_kb", "is_jpeg", "jpeg_qstep", "sharpness", "brightness", "saturation", "green_frac"]
+XM = AM[MCOLS].values.astype(np.float32)
+
+acq_tab = AM.assign(dataset=D_SRC).groupby("dataset")[["native_long", "native_short", "file_kb", "jpeg_qstep",
+                                                       "sharpness", "saturation", "green_frac"]].median()
+acq_tab.to_csv(TABLES / "d1_acquisition_by_source.csv")
+report("D1 - acquisition metadata by source (median)", md_table(acq_tab, "{:.2f}"))
+
+def meta_probe(mask, target):
+    pred = np.full(len(ROWS), None, dtype=object)
+    for tr, te in D_FOLDS:
+        tr, te = tr[mask[tr]], te[mask[te]]
+        if len(te) == 0 or len(set(target[tr])) < 2:
+            continue
+        clf = HistGradientBoostingClassifier(max_iter=200, learning_rate=0.1, class_weight="balanced", random_state=0)
+        clf.fit(XM[tr], target[tr]); pred[te] = clf.predict(XM[te])
+    return bacc(target[mask], pred[mask]), len(set(target[mask]))
+
+d1 = []
+for name, mask in [("all images", np.ones(len(ROWS), bool))] + [(f"within {c}", D_LAB == c) for c in SHARED3]:
+    b, k = meta_probe(mask, D_SRC)
+    d1.append(dict(target="source", subset=name, balanced_acc=b, chance=1 / k, n=int(mask.sum())))
+for s in dss:
+    mask = D_SRC == s
+    if len(set(D_LAB[mask])) >= 2:
+        b, k = meta_probe(mask, D_LAB)
+        d1.append(dict(target="disease", subset=f"within source {s}", balanced_acc=b, chance=1 / k, n=int(mask.sum())))
+d1 = pd.DataFrame(d1); d1["above_chance"] = d1.balanced_acc - d1.chance
+d1.to_csv(TABLES / "d1_metadata_probes.csv", index=False)
+report("D1 - what metadata alone can predict (balanced accuracy, grouped CV)", md_table(d1, "{:.3f}"))
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 3.6))
+for ax, col, lab_ in zip(axes, ["native_short", "file_kb", "sharpness"],
+                         ["native short side (px, log scale)", "file size (kB, log scale)", "sharpness (log Laplacian var.)"]):
+    data = [AM[col].values[D_SRC == s] for s in dss]
+    ax.boxplot(data, showfliers=False); ax.set_xticks(range(1, len(dss) + 1)); ax.set_xticklabels(dss, rotation=20, fontsize=8)
+    if col != "sharpness":
+        ax.set_yscale("log")
+    ax.set_title(lab_, fontsize=9)
+plt.tight_layout(); plt.savefig(FIGS / "d1_acquisition_by_source.png", dpi=120); plt.show()
+##CELL md
+### 8.2 D2: source identifiability of foundation features (within class), before and after erasure
+##CELL code
+XG = np.asarray(TILE_FEATS[MAIN_FM][ROWS, 0], dtype=np.float32)       # global view, main encoder
+src_code = pd.Series(D_SRC).map(DS2I).values
+lab_code = pd.Series(D_LAB).map(C2I).values
+tasks = ([("source", "all images", np.ones(len(ROWS), bool), D_SRC)] +
+         [("source", f"within {c}", D_LAB == c, D_SRC) for c in SHARED3] +
+         [("disease", "all images", np.ones(len(ROWS), bool), D_LAB)])
+preds = {}
+for fi, (tr, te) in enumerate(tqdm(D_FOLDS, desc="D2 probes")):
+    mu, sd = XG[tr].mean(0), XG[tr].std(0) + 1e-6
+    Xtr_t = torch.tensor((XG[tr] - mu) / sd, device=DEVICE); Xte_t = torch.tensor((XG[te] - mu) / sd, device=DEVICE)
+    variants = {"raw": (Xtr_t, Xte_t)}
+    for ename, yy in (("class-cond. LEACE", torch.tensor(lab_code[tr])), ("global LEACE", None)):
+        er = Eraser(Xtr_t, torch.tensor(src_code[tr]), yy)
+        variants[ename] = (er(Xtr_t), er(Xte_t))
+    for vname, (A, B) in variants.items():
+        A, B = A.cpu().numpy(), B.cpu().numpy()
+        for target, subset, mask, tgt in tasks:
+            mtr, mte = mask[tr], mask[te]
+            for probe, hid in (("linear", 0), ("MLP", 256)):
+                if target == "disease" and probe == "MLP":
+                    continue
+                key = (target, subset, vname, probe)
+                preds.setdefault(key, np.full(len(ROWS), None, dtype=object))
+                if mte.any():
+                    preds[key][te[mte]] = torch_probe(A[mtr], tgt[tr][mtr], B[mte], hidden=hid)
+d2 = []
+for (target, subset, vname, probe), p in preds.items():
+    mask = next(m for t, s, m, _ in tasks if t == target and s == subset)
+    tgt = D_SRC if target == "source" else D_LAB
+    d2.append(dict(target=target, subset=subset, features=vname, probe=probe,
+                   balanced_acc=bacc(tgt[mask], p[mask]), chance=1 / len(set(tgt[mask]))))
+d2 = pd.DataFrame(d2)
+d2.to_csv(TABLES / "d2_feature_source_probes.csv", index=False)
+d2p = d2.pivot_table(index=["target", "subset", "probe"], columns="features", values="balanced_acc")
+d2p = d2p.join(d2.groupby(["target", "subset", "probe"]).chance.first())
+report(f"D2 - source / disease identifiability from {MAIN_FM} global features (balanced accuracy, grouped CV)", md_table(d2p))
+##CELL md
+### 8.3 D3: label-consistency index across sources
+##CELL code
+def l2n(a):
+    return a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-8)
+
+ZG = l2n((XG - XG.mean(0)) / (XG.std(0) + 1e-6))
+ZC = ZG.copy()
+for s in dss:                                     # per-source centring removes a global style offset
+    m = D_SRC == s
+    ZC[m] = ZG[m] - ZG[m].mean(0)
+ZC = l2n(ZC)
+
+def centroids(Z, min_n=10):
+    out = {}
+    for (s, c), ix in pd.Series(np.arange(len(ROWS))).groupby([D_SRC, D_LAB]).groups.items():
+        if len(ix) >= min_n:
+            out[(s, c)] = l2n(Z[np.asarray(ix)].mean(0, keepdims=True))[0]
+    return out
+
+lci_rows, transfer_rows = [], []
+for space, Z in (("raw", ZG), ("source-centred", ZC)):
+    cen = centroids(Z)
+    for c in CLASSES:
+        srcs = [s for s in dss if (s, c) in cen]
+        for A in srcs:
+            for B in srcs:
+                if A == B:
+                    continue
+                others = [c2 for (s2, c2) in cen if s2 == B and c2 != c]
+                if not others:
+                    continue
+                same = float(cen[(A, c)] @ cen[(B, c)])
+                best_other = max(others, key=lambda c2: float(cen[(A, c)] @ cen[(B, c2)]))
+                lci_rows.append(dict(space=space, cls=c, src_A=A, src_B=B, cos_same=same,
+                                     cos_best_other=float(cen[(A, c)] @ cen[(B, best_other)]),
+                                     nearest_other_class=best_other, LCI=same - float(cen[(A, c)] @ cen[(B, best_other)])))
+    # nearest-centroid transfer: classify A's images with B's class centroids (shared classes only)
+    for A in dss:
+        for B in dss:
+            if A == B:
+                continue
+            shared = [c for c in CLASSES if (A, c) in cen and (B, c) in cen]
+            if len(shared) < 2:
+                continue
+            m = (D_SRC == A) & np.isin(D_LAB, shared)
+            C = np.stack([cen[(B, c)] for c in shared])
+            pred = np.array(shared)[(Z[m] @ C.T).argmax(1)]
+            transfer_rows.append(dict(space=space, train_src=B, test_src=A, shared=", ".join(shared),
+                                      macro_f1=f1_score(D_LAB[m], pred, labels=shared, average="macro"), chance=1 / len(shared)))
+lci = pd.DataFrame(lci_rows); lci.to_csv(TABLES / "d3_label_consistency_pairs.csv", index=False)
+if len(lci):
+    lsum = lci.pivot_table(index="cls", columns="space", values="LCI", aggfunc="mean")
+    lsum["pairs"] = lci[lci.space == "raw"].groupby("cls").size()
+    def verdict(r):
+        if r.get("source-centred", np.nan) > 0 and r.get("raw", np.nan) > 0:
+            return "consistent"
+        if r.get("source-centred", np.nan) > 0:
+            return "style-shifted (consistent after centring)"
+        return "INCONSISTENT -> expert audit"
+    lsum["verdict"] = lsum.apply(verdict, axis=1)
+    lsum.to_csv(TABLES / "d3_label_consistency_summary.csv")
+    report("D3 - label-consistency index per class (mean over source pairs; > 0 = same name, same look)", md_table(lsum))
+    LCI_SUMMARY = lsum
+else:
+    LCI_SUMMARY = pd.DataFrame()
+tr_df = pd.DataFrame(transfer_rows)
+if len(tr_df):
+    tr_df.to_csv(TABLES / "d3_nearest_centroid_transfer.csv", index=False)
+    report("D3 - nearest-centroid transfer between sources (shared classes only)",
+           md_table(tr_df.pivot_table(index=["train_src", "test_src"], columns="space", values="macro_f1")))
+
+cen = centroids(ZC)
+keys = sorted(cen, key=lambda k: (k[1], k[0]))
+if keys:
+    Mx = np.array([[cen[a] @ cen[b] for b in keys] for a in keys])
+    fig, ax = plt.subplots(figsize=(0.42 * len(keys) + 3, 0.42 * len(keys) + 2))
+    im = ax.imshow(Mx, cmap="RdBu_r", vmin=-1, vmax=1)
+    lab_ = [f"{c} | {s}" for s, c in keys]
+    ax.set_xticks(range(len(keys))); ax.set_xticklabels(lab_, rotation=90, fontsize=7)
+    ax.set_yticks(range(len(keys))); ax.set_yticklabels(lab_, fontsize=7)
+    plt.colorbar(im, fraction=0.03); ax.set_title(f"cosine between (class | source) centroids, {MAIN_FM}, source-centred", fontsize=9)
+    plt.tight_layout(); plt.savefig(FIGS / "d3_centroid_similarity.png", dpi=120); plt.show()
+##CELL md
+## 9. SERA heads on frozen tile features (RQ2)
+For every split, the frozen tile features are standardized on the training part. Then:
+- **Class-conditional source erasure (CCE)**: a LEACE eraser is fitted on the *training* tiles with source = the three training datasets and the class labels for conditioning. It is applied unchanged to validation and test tiles, so it needs no target data.
+- **Gated-attention MIL** (Ilse et al. 2018) over the 14 views with a learned scale embedding and tile dropout. The head can use the zoomed tiles when the lesion is small (whole-plant photos) and the global view when the image is already a close-up.
+- Class × source balanced sampling (as v1), AdamW, cosine schedule, **no label smoothing** (v1: label smoothing + temperature scaling made held-out ECE worse), weight decay ∈ {1e-4, 1e-2} and the best epoch chosen on the **source validation split only**.
+
+| model | tiles | pooling | erasure | role |
+|---|---|---|---|---|
+| `LP-global` | global | – | – | = v1 frozen-FM linear probe (baseline) |
+| `LP-global+FMM` | global | – | – | + transductive feature moment matching (best simple adaptation in Xiang et al. 2026) |
+| `LP-mean` | 14 | mean | – | multi-scale information alone |
+| `MIL` | 14 | gated attention | – | + learned scale selection |
+| `LP-global+CCE` | global | – | class-cond. | erasure alone |
+| `MIL+GE` | 14 | gated attention | global LEACE | erasure ignoring the class mix (ablation) |
+| **`SERA`** | 14 | gated attention | class-cond. | **proposed** |
+| `SERA-5` | 5 | gated attention | class-cond. | phone budget (global + 2×2) |
+
+Each head trains in seconds, so every LODO model gets **10 seeds**, and the gate models also get full leave-one-source-out runs.
+##CELL code
+HEAD_VARIANTS = {
+    "LP-global":     dict(pool="global"),
+    "LP-global+FMM": dict(pool="global", fmm=True),
+    "LP-mean":       dict(pool="mean"),
+    "MIL":           dict(pool="mil"),
+    "LP-global+CCE": dict(pool="global", erase="cc"),
+    "MIL+GE":        dict(pool="mil", erase="global"),
+    "SERA":          dict(pool="mil", erase="cc"),
+    "SERA-5":        dict(pool="mil", erase="cc", n_tiles=1 + 4),
+}
+M_ = lambda v, fm: f"{v}@{fm}"
+HEAD_LODO = [M_(v, MAIN_FM) for v in HEAD_VARIANTS if v != "SERA-5"]
+for fm in FMS:
+    if fm != MAIN_FM:
+        HEAD_LODO += [M_("LP-global", fm), M_("SERA", fm)]
+HEAD_LODO.append(M_("SERA-5", EDGE_FM))
+HEAD_LODO = list(dict.fromkeys(HEAD_LODO))
+PROPOSED, BASE_HEAD = M_("SERA", MAIN_FM), M_("LP-global", MAIN_FM)
+GATE_MODELS = list(dict.fromkeys([BASE_HEAD, PROPOSED, M_("SERA", EDGE_FM)]))
+CV_HEADS = [BASE_HEAD, PROPOSED]
+HEAD_TAG = hashlib.md5(f"{split_sig}|{TILE_TAG}|{HEAD_EPOCHS}|{HEAD_BATCH}|{TILE_DROP}|{KNN_K}|{SMOKE}".encode()).hexdigest()[:12]
+
+def head_key(model, proto, split, seed):
+    return run_key("H_" + model.replace("@", "_at_"), proto, split, seed)
+
+def head_done(key):
+    f = HEADS / f"{key}.json"
+    if not f.exists():
+        return False
+    try:
+        return json.loads(f.read_text()).get("tag") == HEAD_TAG
+    except Exception:
+        return False
+
+class PoolHead(nn.Module):
+    def __init__(self, D, K, pool, n_tiles, hidden=128):
+        super().__init__()
+        self.pool = pool
+        self.drop = nn.Dropout(0.1)
+        self.cls = nn.Linear(D, K)
+        if pool == "mil":
+            self.scale_emb = nn.Parameter(torch.zeros(len(TILE_GRIDS), D))
+            self.register_buffer("sidx", SCALE_IDX[:n_tiles].clone())
+            self.V, self.U, self.w = nn.Linear(D, hidden), nn.Linear(D, hidden), nn.Linear(hidden, 1)
+
+    def forward(self, x, keep=None):
+        """x: B x T x D standardized (and possibly erased) tile features; keep: B x T bool tile mask."""
+        a = None
+        if self.pool == "global":
+            z = x[:, 0]
+        elif self.pool == "mean":
+            k = torch.ones(x.shape[:2], device=x.device) if keep is None else keep.float()
+            z = (x * k.unsqueeze(-1)).sum(1) / k.sum(1, keepdim=True)
+        else:
+            h = x + self.scale_emb[self.sidx]
+            s = self.w(torch.tanh(self.V(h)) * torch.sigmoid(self.U(h))).squeeze(-1)
+            if keep is not None:
+                s = s.masked_fill(~keep, -1e4)
+            a = s.float().softmax(1)
+            z = (a.unsqueeze(-1) * h).sum(1)
+        return self.cls(self.drop(z)), a, z
+
+def bag(fm, ix, n_tiles, ext=False):
+    arr = EXT_FEATS[fm] if ext else TILE_FEATS[fm]
+    ix = np.asarray(ix); o = np.argsort(ix)
+    out = np.empty((len(ix), n_tiles, arr.shape[2]), np.float32)
+    if len(ix):
+        out[o] = arr[ix[o], :n_tiles]                 # sorted reads from the memory map
+    return torch.from_numpy(out).to(DEVICE)
+
+@torch.no_grad()
+def head_forward(model, X, bs=2048, keep=None):
+    model.eval(); L, A, Z = [], [], []
+    for i in range(0, len(X), bs):
+        l, a, z = model(X[i:i + bs], None if keep is None else keep[i:i + bs])
+        L.append(l.float().cpu()); Z.append(z.float()); A.append(None if a is None else a.cpu())
+    if not L:
+        return np.zeros((0, model.cls.out_features), np.float32), None, torch.zeros(0, model.cls.in_features, device=DEVICE)
+    return torch.cat(L).numpy(), (torch.cat(A).numpy() if A[0] is not None else None), torch.cat(Z)
+
+def knn_dist(ref, q, k=KNN_K):
+    """Mean cosine distance to the k nearest TRAINING embeddings (Sun et al., ICML 2022)."""
+    ref = F.normalize(ref, dim=1); q = F.normalize(q, dim=1); out = []
+    for i in range(0, len(q), 2048):
+        out.append(1 - (q[i:i + 2048] @ ref.T).topk(min(k, len(ref)), dim=1).values.mean(1))
+    return torch.cat(out).cpu().numpy() if out else np.zeros(0, np.float32)
+
+def fit_head(Xtr, ytr, w, Xva, yva, K, pool, seed, wd):
+    set_seed(seed)
+    model = PoolHead(Xtr.shape[-1], K, pool, Xtr.shape[1]).to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=wd)
+    steps = max(1, math.ceil(len(Xtr) / HEAD_BATCH)); total = HEAD_EPOCHS * steps
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * min(1.0, s / total))))
+    best_f1, best_state, labels = -1.0, None, np.unique(yva)
+    for ep in range(HEAD_EPOCHS):
+        model.train()
+        draw = torch.multinomial(w, steps * HEAD_BATCH, replacement=True).to(DEVICE)
+        for s in range(steps):
+            b = draw[s * HEAD_BATCH:(s + 1) * HEAD_BATCH]
+            x, keep = Xtr[b], None
+            if pool != "global" and TILE_DROP > 0:
+                keep = torch.rand(x.shape[:2], device=DEVICE) > TILE_DROP
+                keep[:, 0] |= ~keep.any(1)
+            loss = F.cross_entropy(model(x, keep)[0], ytr[b])
+            opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); sched.step()
+        if ep % 2 == 1 or ep == HEAD_EPOCHS - 1:
+            f1 = f1_macro_np(yva, head_forward(model, Xva)[0].argmax(1), labels)
+            if f1 > best_f1:
+                best_f1, best_state = f1, copy.deepcopy(model.state_dict())
+    model.load_state_dict(best_state); model.eval()
+    return model, best_f1
+
+def build_and_train(model_name, proto, split, seed, keep_X=False):
+    variant, fm = model_name.split("@"); spec = HEAD_VARIANTS[variant]
+    S = SPLITS[(proto, split)]; ext = proto == "ext"
+    tr, va, te = S["train"], S["val"], S["test"]
+    classes = np.array(sorted(set(Y_ALL[tr].tolist())))
+    K = len(classes)
+    g2l = torch.full((len(CLASSES),), -1, dtype=torch.long); g2l[torch.tensor(classes)] = torch.arange(K)
+    nt = 1 if spec["pool"] == "global" else spec.get("n_tiles", N_TILES)
+    Xtr, Xva, Xte = bag(fm, tr, nt), bag(fm, va, nt), bag(fm, te, nt, ext)
+    mu, sd = Xtr.mean((0, 1)), Xtr.std((0, 1)) + 1e-6
+    Xtr, Xva, Xte = (Xtr - mu) / sd, (Xva - mu) / sd, (Xte - mu) / sd
+    info = dict(erase_rank=0)
+    if spec.get("erase"):
+        er = Eraser(Xtr.flatten(0, 1), D_ALL[tr].repeat_interleave(nt).to(DEVICE),
+                    Y_ALL[tr].repeat_interleave(nt).to(DEVICE) if spec["erase"] == "cc" else None)
+        Xtr, Xva, Xte = er(Xtr), er(Xva), er(Xte)
+        info["erase_rank"] = er.rank
+        del er
+    if spec.get("fmm") and len(Xte):     # transductive: match the unlabelled test set's moments to training (mean 0, sd 1)
+        Xte = (Xte - Xte.mean((0, 1))) / (Xte.std((0, 1)) + 1e-6)
+    ytr = g2l[Y_ALL[tr]].to(DEVICE); yva = g2l[Y_ALL[va]].numpy()
+    cls_n = Counter(ytr.tolist()); dom = D_ALL[tr]; dom_n = Counter(dom.tolist())
+    w = torch.tensor([cls_n[int(c)] ** -0.5 * dom_n[int(d)] ** -0.5 for c, d in zip(ytr.tolist(), dom.tolist())],
+                     dtype=torch.float)
+    best = None
+    for wd in (1e-4, 1e-2):
+        model, f1 = fit_head(Xtr, ytr, w, Xva, yva, K, spec["pool"], seed, wd)
+        if best is None or f1 > best[1]:
+            best = (model, f1, wd)
+    model, vf1, wd = best
+    lv, _, zv = head_forward(model, Xva)
+    lt, at, zt = head_forward(model, Xte)
+    _, _, ztr = head_forward(model, Xtr)
+    out = dict(model=model, classes=classes, val_idx=va, test_idx=te, val_logits=lv, test_logits=lt,
+               val_knn=knn_dist(ztr, zv), test_knn=knn_dist(ztr, zt), test_att=at,
+               info=dict(info, weight_decay=wd, val_macro_f1=vf1))
+    if keep_X:
+        out["X"] = (Xtr, Xva, Xte)
+    else:
+        del Xtr, Xva, Xte
+    return out
+
+def run_head(model_name, proto, split, seed):
+    key = head_key(model_name, proto, split, seed)
+    if head_done(key):
+        return None
+    t = time.time()
+    r = build_and_train(model_name, proto, split, seed)
+    extra = {"test_att": r["test_att"].astype(np.float16)} if (r["test_att"] is not None and seed == HEAD_SEEDS[0]
+                                                                and proto in ("lodo", "ext")) else {}
+    np.savez_compressed(HEADS / f"{key}.npz", val_idx=r["val_idx"], val_logits=r["val_logits"], test_idx=r["test_idx"],
+                        test_logits=r["test_logits"], val_knn=r["val_knn"], test_knn=r["test_knn"],
+                        classes=r["classes"], **extra)
+    S = SPLITS[(proto, split)]
+    pos = {g: i for i, g in enumerate(r["test_idx"])}
+    sel = np.array([pos[g] for g in S["test_id"]], dtype=int)
+    y = y_of(proto, S["test_id"])
+    f1 = f1_macro_np(y, r["classes"][r["test_logits"][sel].argmax(1)], np.unique(y)) if len(sel) else np.nan
+    save_json(dict(key=key, model=model_name, protocol=proto, split=split, seed=seed, classes=r["classes"].tolist(),
+                   tag=HEAD_TAG, minutes=(time.time() - t) / 60, test_id_macro_f1=f1, **r["info"]), HEADS / f"{key}.json")
+    del r; torch.cuda.empty_cache()
+    return f1
+##CELL md
+### 9.1 Run all heads (priority order, resumable)
+Order: LODO seed 0 for every head → leave-one-source-out runs of the gate models → in-domain CV → external → remaining seeds.
+##CELL code
+lodo_splits = [k for k in SPLITS if k[0] == "lodo"]
+inner_splits = [k for k in SPLITS if k[0] == "inner"]
+cv_splits = [k for k in SPLITS if k[0] == "cv"]
+HPLAN = [(m, sp, HEAD_SEEDS[0]) for m in HEAD_LODO for sp in lodo_splits]
+HPLAN += [(m, sp, s) for s in INNER_SEEDS for m in GATE_MODELS for sp in inner_splits]
+HPLAN += [(m, sp, HEAD_SEEDS[0]) for m in CV_HEADS for sp in cv_splits]
+if ("ext", "all") in SPLITS:
+    HPLAN += [(m, ("ext", "all"), s) for s in INNER_SEEDS for m in GATE_MODELS]
+HPLAN += [(m, k, s) for s in INNER_SEEDS for m in GATE_MODELS for k in SPLITS if k[0] == "single"]
+HPLAN += [(m, sp, s) for s in HEAD_SEEDS[1:] for m in HEAD_LODO for sp in lodo_splits]
+HPLAN += [(m, k, s) for s in INNER_SEEDS for m in GATE_MODELS for k in SPLITS if k[0] == "lco"]   # v4 (section 12.2)
+done = sum(head_done(head_key(m, *sp, s)) for m, sp, s in HPLAN)
+print(f"head plan: {len(HPLAN)} runs | already done: {done}")
+t_h = time.time()
+for i, (m, (proto, split), s) in enumerate(tqdm(HPLAN, desc="heads")):
+    f1 = run_head(m, proto, split, s)
+    if f1 is not None and (s == HEAD_SEEDS[0] and proto == "lodo"):
+        print(f"{m:28s} {proto}/{split:18s} s{s}: macro-F1(ID test) = {f1:.3f}")
+print(f"heads finished in {(time.time() - t_h) / 60:.1f} min | elapsed {hours():.2f} h")
+##CELL md
+## 10. Fine-tuned baselines (earlier runs reused; missing runs trained, time-guarded)
+Earlier runs are reused when their split signature and training budget match (`RUN_TAG`). Missing runs are trained with **exactly v1's recipe**:
+1. **first**, the gate model(s) in `FT_GATE_MODELS` on LODO and on every leave-one-source-out split (seed 0). New runs also store **kNN feature distances**, so the risk-controlled gate (section 12) can be calibrated on the strongest fine-tuned network too;
+2. then the remaining seeds of `FT_MODELS`, so that every comparison has ≥ 3 seeds.
+
+Runs stop at `TIME_BUDGET_H`; re-run with this output attached to continue.
+##CELL code
+BACKBONES = {
+    "resnet50":        dict(timm="resnet50.a1_in1k", lr=3e-4),
+    "efficientnet_b0": dict(timm="efficientnet_b0.ra_in1k", lr=3e-4),
+    "mobilenetv3_l":   dict(timm="mobilenetv3_large_100.ra_in1k", lr=3e-4),
+    "convnext_tiny":   dict(timm="convnext_tiny.fb_in1k", lr=2e-4),
+    "vit_small":       dict(timm="vit_small_patch16_224.augreg_in21k_ft_in1k", lr=1e-4),
+}
+FT_BACKBONE = {"ResNet50": "resnet50", "EfficientNetB0": "efficientnet_b0", "MobileNetV3L": "mobilenetv3_l",
+               "ConvNeXtT": "convnext_tiny", "ViTS": "vit_small", "ViTS-kNN": "vit_small",
+               "DG:MixStyle": "efficientnet_b0", "DG:SWA": "efficientnet_b0"}
+DG_OPTS = {"DG:MixStyle": dict(mixstyle=True), "DG:SWA": dict(swa=True)}   # v1 domain-generalization recipes
+MIXSTYLE_P, MIXSTYLE_ALPHA, SWA_START = 0.5, 0.1, 0.5
+DG_MODELS = [m for m in globals().get("DG_MODELS", []) if m in DG_OPTS]
+FT_GATE_SEEDS = globals().get("FT_GATE_SEEDS", SEEDS[:1])
+V1_MODELS = list(dict.fromkeys(["ResNet50", "EfficientNetB0", "MobileNetV3L", "ConvNeXtT", "ViTS", "FM:DINOv2-B", "FM:DINOv3-B",
+                                "FM:BioCLIP-2", "DG:MixStyle", "DG:AmpMix+Cons", "DG:SWA", "SILA-Net"] + FT_MODELS + FT_GATE_MODELS))
+CACHE_T = torch.from_numpy(CACHE)
+
+def mixstyle(x, p=MIXSTYLE_P, alpha=MIXSTYLE_ALPHA, eps=1e-6):
+    """MixStyle (Zhou et al., ICLR 2021): mix channel-wise feature statistics between random pairs (as v1)."""
+    if x.dim() != 4 or torch.rand(1).item() > p:
+        return x
+    dt, x = x.dtype, x.float()
+    B = x.size(0)
+    mu = x.mean((2, 3), keepdim=True).detach()
+    sig = (x.var((2, 3), keepdim=True) + eps).sqrt().detach()
+    lam = torch.distributions.Beta(alpha, alpha).sample((B, 1, 1, 1)).to(x.device)
+    perm = torch.randperm(B, device=x.device)
+    mu2, sig2 = lam * mu + (1 - lam) * mu[perm], lam * sig + (1 - lam) * sig[perm]
+    return (((x - mu) / sig) * sig2 + mu2).to(dt)
+
+def stage_modules(bb):
+    if hasattr(bb, "layer1"):
+        return [bb.layer1, bb.layer2, bb.layer3]
+    if hasattr(bb, "stages"):
+        return list(bb.stages)[:3]
+    if hasattr(bb, "blocks") and isinstance(bb.blocks, nn.Sequential):
+        return list(bb.blocks)[:3]
+    return []
+
+@torch.no_grad()
+def bn_update(model, tr_t, w, n_batches=50):
+    """Recompute BatchNorm running statistics of an averaged (SWA) model on augmented training batches."""
+    bns = [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    if not bns:
+        return
+    for m in bns:
+        m.reset_running_stats(); m.momentum = None
+    model.train()
+    for _ in range(n_batches):
+        sel = torch.multinomial(w, BATCH, replacement=True)
+        x = gpu_augment(CACHE_T[tr_t[sel]].to(DEVICE, non_blocking=True))
+        with torch.autocast(DEVICE.type, dtype=torch.float16, enabled=AMP):
+            model(x)
+    model.eval()
+
+def gpu_augment(xb):
+    """v1 augmentation: random-resized crop + rotation + flip (one affine warp), mild b/c/s jitter, no hue."""
+    x = xb.float() / 255.0
+    B, dev = x.size(0), x.device
+    area = torch.empty(B, device=dev).uniform_(0.55, 1.0)
+    logr = torch.empty(B, device=dev).uniform_(math.log(3 / 4), math.log(4 / 3))
+    sw = torch.sqrt(area * torch.exp(logr)).clamp(max=1.0); sh = torch.sqrt(area / torch.exp(logr)).clamp(max=1.0)
+    tx = (1 - sw) * torch.empty(B, device=dev).uniform_(-1, 1); ty = (1 - sh) * torch.empty(B, device=dev).uniform_(-1, 1)
+    ang = torch.empty(B, device=dev).uniform_(-15, 15) * math.pi / 180
+    flip = torch.where(torch.rand(B, device=dev) < 0.5, -1.0, 1.0)
+    cos, sin = torch.cos(ang), torch.sin(ang)
+    theta = torch.stack([torch.stack([cos * sw * flip, -sin * sh, tx], 1), torch.stack([sin * sw * flip, cos * sh, ty], 1)], 1)
+    grid = F.affine_grid(theta, (B, 3, IMG_SIZE, IMG_SIZE), align_corners=False)
+    x = F.grid_sample(x, grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+    b = torch.empty(B, 1, 1, 1, device=dev).uniform_(0.8, 1.2); c = torch.empty(B, 1, 1, 1, device=dev).uniform_(0.8, 1.2)
+    s = torch.empty(B, 1, 1, 1, device=dev).uniform_(0.8, 1.2)
+    x = x * b
+    gray = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+    x = (x - gray.mean((2, 3), keepdim=True)) * c + gray.mean((2, 3), keepdim=True)
+    gray = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+    return (gray + (x - gray) * s).clamp(0, 1)
+
+def eval_view(xb):
+    return F.interpolate(xb.float() / 255.0, size=(IMG_SIZE, IMG_SIZE), mode="bilinear", antialias=True, align_corners=False)
+
+class FTNet(nn.Module):
+    def __init__(self, backbone, n_classes, pretrained=True):
+        super().__init__()
+        self.backbone = timm.create_model(BACKBONES[backbone]["timm"], pretrained=pretrained and PRETRAINED,
+                                          num_classes=n_classes, drop_rate=0.2)
+        cfg = timm.data.resolve_data_config({}, model=self.backbone)
+        self.register_buffer("mean", torch.tensor(cfg["mean"]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor(cfg["std"]).view(1, 3, 1, 1))
+    def forward(self, x01):
+        return self.backbone((x01 - self.mean) / self.std)
+
+@torch.no_grad()
+def predict_logits(model, ix, bs=64):
+    model.eval(); out = []
+    for b in batches(np.asarray(ix), bs):
+        x = eval_view(CACHE_T[b].to(DEVICE, non_blocking=True))
+        with torch.autocast(DEVICE.type, dtype=torch.float16, enabled=AMP):
+            lg = model(x)
+        if not torch.isfinite(lg).all():
+            lg = model(x)
+        out.append(lg.float().cpu())
+    return torch.cat(out).numpy() if out else np.zeros((0, 0), np.float32)
+
+def train_ft(backbone, tr, va, classes, seed, opts=None):
+    """v1 training recipe (timm head): class x source sampler, AdamW (head lr x10), warm-up + cosine,
+    label smoothing 0.1, AMP, best validation macro-F1 checkpoint. opts: mixstyle=True (MixStyle after the first
+    three stages) or swa=True (weight average from SWA_START of training, BatchNorm recomputed), as in v1."""
+    set_seed(seed)
+    opts = opts or {}
+    K = len(classes)
+    g2l = torch.full((len(CLASSES),), -1, dtype=torch.long); g2l[torch.tensor(classes)] = torch.arange(K)
+    y_tr = g2l[Y_ALL[tr]]; y_va = g2l[Y_ALL[va]].numpy()
+    model = FTNet(backbone, K).to(DEVICE)
+    if opts.get("mixstyle"):
+        for st in stage_modules(model.backbone):
+            st.register_forward_hook(lambda mod, inp, out: mixstyle(out) if mod.training else out)
+    hp = {id(p) for p in model.backbone.get_classifier().parameters()}
+    base_lr = BACKBONES[backbone]["lr"]
+    opt = torch.optim.AdamW([{"params": [p for p in model.parameters() if id(p) not in hp], "lr": base_lr},
+                             {"params": [p for p in model.parameters() if id(p) in hp], "lr": base_lr * 10}], weight_decay=0.05)
+    steps = max(1, math.ceil(len(tr) / BATCH)); total = EPOCHS * steps
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / steps) *
+                                              (0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * min(1.0, s / total)))))
+    scaler = torch.amp.GradScaler("cuda", enabled=AMP)
+    cls_n = Counter(y_tr.tolist()); dom = D_ALL[tr]; dom_n = Counter(dom.tolist())
+    w = torch.tensor([cls_n[int(c)] ** -0.5 * dom_n[int(d)] ** -0.5 for c, d in zip(y_tr, dom)], dtype=torch.float)
+    tr_t = torch.as_tensor(tr)
+    best, best_state, hist = -1.0, None, []
+    swa, swa_start = None, int(EPOCHS * SWA_START)
+    for ep in range(EPOCHS):
+        model.train(); run_loss = 0.0
+        draw = torch.multinomial(w, steps * BATCH, replacement=True)
+        for s in range(steps):
+            sel = draw[s * BATCH:(s + 1) * BATCH]
+            x = gpu_augment(CACHE_T[tr_t[sel]].to(DEVICE, non_blocking=True)); yb = y_tr[sel].to(DEVICE)
+            with torch.autocast(DEVICE.type, dtype=torch.float16, enabled=AMP):
+                loss = F.cross_entropy(model(x).float(), yb, label_smoothing=0.1)
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward(); scaler.unscale_(opt); nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            scaler.step(opt); scaler.update(); sched.step(); run_loss += loss.item()
+        f1 = f1_score(y_va, predict_logits(model, va).argmax(1), average="macro")
+        hist.append(dict(epoch=ep, loss=run_loss / steps, val_macro_f1=f1))
+        if f1 > best:
+            best, best_state = f1, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        if opts.get("swa") and ep >= swa_start:
+            if swa is None:
+                swa = torch.optim.swa_utils.AveragedModel(model)
+            swa.update_parameters(model)
+    if swa is not None:   # SWA: use the weight average (not the best epoch), then recompute BatchNorm statistics
+        model = swa.module
+        bn_update(model, tr_t, w)
+        hist.append(dict(epoch="swa", val_macro_f1=f1_score(y_va, predict_logits(model, va).argmax(1), average="macro")))
+        return model, hist
+    model.load_state_dict(best_state)
+    return model, hist
+
+@torch.no_grad()
+def ft_embed(model, ix, bs=128):
+    """Penultimate (pre-logit) features of a fine-tuned model, evaluation view."""
+    model.eval(); out = []
+    for b in batches(np.asarray(ix), bs):
+        x = (eval_view(CACHE_T[b].to(DEVICE, non_blocking=True)) - model.mean) / model.std
+        with torch.autocast(DEVICE.type, dtype=torch.float16, enabled=AMP):
+            f = model.backbone.forward_head(model.backbone.forward_features(x), pre_logits=True)
+        out.append(f.float())
+    return torch.cat(out)
+
+# priority: gate model on LODO + every leave-one-source-out split (seed 0), then the remaining baseline seeds
+FT_PLAN = []
+if RUN_FT_BASELINES:
+    FT_PLAN += [(m, ("lodo", h), SEEDS[0]) for m in FT_GATE_MODELS for h in dss]
+    FT_PLAN += [(m, sp, SEEDS[0]) for m in FT_GATE_MODELS for sp in inner_splits]
+    FT_PLAN += [(m, ("lodo", h), s) for s in SEEDS for m in FT_MODELS for h in dss]
+    # v4: remaining seeds of the gate model (LODO + leave-one-source-out), then the domain-generalization baselines
+    FT_PLAN += [(m, ("lodo", h), s) for s in FT_GATE_SEEDS for m in FT_GATE_MODELS for h in dss]
+    FT_PLAN += [(m, sp, s) for s in FT_GATE_SEEDS for m in FT_GATE_MODELS for sp in inner_splits]
+    FT_PLAN += [(m, ("lodo", h), s) for s in SEEDS for m in DG_MODELS for h in dss]
+FT_PLAN = list(dict.fromkeys(FT_PLAN))
+todo = [p for p in FT_PLAN if not run_done(run_key(p[0], *p[1], p[2]))]
+print(f"fine-tuned plan: {len(FT_PLAN)} runs | to train: {len(todo)}")
+for m, (proto, split), seed in todo:
+    if hours() > TIME_BUDGET_H:
+        print(f"time budget reached ({hours():.1f} h): remaining fine-tuning runs skipped; re-run with this output attached")
+        break
+    S = SPLITS[(proto, split)]; key = run_key(m, proto, split, seed)
+    classes = sorted(set(int(c) for c in Y_ALL[S["train"]].tolist()))
+    t = time.time()
+    model, hist = train_ft(FT_BACKBONE[m], S["train"], S["val"], classes, seed, DG_OPTS.get(m))
+    va_logits, te_logits = predict_logits(model, S["val"]), predict_logits(model, S["test"])
+    ref = np.random.default_rng(seed).permutation(S["train"])[:6000]          # kNN reference: training images
+    z_ref = ft_embed(model, ref)
+    val_knn, test_knn = knn_dist(z_ref, ft_embed(model, S["val"])), knn_dist(z_ref, ft_embed(model, S["test"]))
+    np.savez_compressed(RUNS / f"{key}.npz", val_idx=S["val"], val_logits=va_logits, test_idx=S["test"],
+                        test_logits=te_logits, classes=np.array(classes), val_knn=val_knn, test_knn=test_knn)
+    pos = {g: i for i, g in enumerate(S["test"])}
+    y_te = Y_ALL[S["test_id"]].numpy(); pid = np.array(classes)[te_logits[[pos[g] for g in S["test_id"]]].argmax(1)]
+    f1 = f1_score(y_te, pid, labels=sorted(set(y_te)), average="macro") if len(y_te) else float("nan")
+    save_json(dict(key=key, model=m, spec=dict(backbone=FT_BACKBONE[m], head="timm", **DG_OPTS.get(m, {})), protocol=proto, split=split,
+                   seed=seed, classes=classes, epochs=EPOCHS, history=hist, minutes=(time.time() - t) / 60,
+                   test_id_macro_f1=f1, params_m=count_params(model), run_tag=RUN_TAG), RUNS / f"{key}.json")
+    print(f"{key}: macro-F1(ID test)={f1:.3f} | {(time.time() - t) / 60:.1f} min | elapsed {hours():.2f} h")
+    del model; torch.cuda.empty_cache()
+##CELL md
+## 11. Results (RQ1, RQ2): LODO macro-F1, ablation, encoders, degradation, statistics
+- Macro-F1 on each held-out source's images of classes seen in training; mean ± sd over seeds.
+- **Statistics**: hierarchical bootstrap of the mean (over held-out sets) difference in macro-F1. Photo groups are resampled within each held-out set and seeds within each model (1000 replicates). This respects both sources of variance. Wilcoxon over (held-out × seed) pairs is shown as a secondary test, Holm-corrected.
+##CELL code
+_RUN_CACHE = {}
+
+def load_any(model, proto, split, seed):
+    """Load a run of a v2 head (name contains '@') or a v1-format fine-tuned run. None if missing/stale."""
+    k = (model, proto, split, seed)
+    if k in _RUN_CACHE:
+        return _RUN_CACHE[k]
+    if "@" in model:
+        key = head_key(model, proto, split, seed); f = HEADS / f"{key}.npz"; ok = head_done(key)
+    else:
+        key = run_key(model, proto, split, seed); f = RUNS / f"{key}.npz"; ok = run_done(key)
+    r = None
+    if ok and f.exists():
+        z = np.load(f); r = {kk: z[kk] for kk in z.files}; r["classes"] = np.asarray(r["classes"])
+    _RUN_CACHE[k] = r
+    return r
+
+def eval_test(r, proto, split):
+    S = SPLITS[(proto, split)]
+    pos = {g: i for i, g in enumerate(r["test_idx"])}
+    sel = np.array([pos[g] for g in S["test_id"]], dtype=int)
+    y = y_of(proto, S["test_id"]); pred = r["classes"][r["test_logits"][sel].argmax(1)]
+    labels = np.unique(y)
+    pc = f1_per_class_np(y, pred, labels) if len(labels) else []
+    groups = idx.group.values[S["test_id"]] if proto != "ext" else np.arange(len(y)).astype(str)
+    return dict(macro_f1=float(np.mean(pc)) if len(pc) else np.nan, acc=float((pred == y).mean()) if len(y) else np.nan,
+                per_class={CLASSES[c]: v for c, v in zip(labels, pc)}, y=y, pred=pred, groups=groups)
+
+ALL_SEEDS = sorted(set(HEAD_SEEDS) | set(SEEDS) | {0, 1, 2})
+EV = {}
+for m in HEAD_LODO + V1_MODELS:
+    for h in dss:
+        for s in ALL_SEEDS:
+            r = load_any(m, "lodo", h, s)
+            if r is not None:
+                EV[(m, h, s)] = eval_test(r, "lodo", h)
+V1_AVAIL = [m for m in V1_MODELS if any(k[0] == m for k in EV)]
+print("v2 heads with results:", len({k[0] for k in EV if '@' in k[0]}), "| v1/fine-tuned models:", V1_AVAIL)
+
+def lodo_table(models):
+    rows = []
+    for m in models:
+        for h in dss:
+            v = [EV[k]["macro_f1"] for k in EV if k[0] == m and k[1] == h]
+            if v:
+                rows.append(dict(model=m, held_out=h, n_seeds=len(v), macro_f1=np.mean(v), sd=np.std(v)))
+    return pd.DataFrame(rows)
+
+def show_table(models, title, fname, order=None):
+    lt = lodo_table(models)
+    if not len(lt):
+        return lt
+    piv = lt.pivot(index="model", columns="held_out", values="macro_f1")
+    sd_ = lt.pivot(index="model", columns="held_out", values="sd")
+    cell = piv.round(3).astype(str) + " ± " + sd_.round(3).astype(str)
+    cell["mean"] = piv.mean(axis=1).round(3)
+    cell["seeds"] = lt.groupby("model").n_seeds.min()
+    cell = cell.reindex(order) if order else cell.sort_values("mean", ascending=False)
+    cell = cell.dropna(how="all")
+    cell.to_csv(TABLES / fname)
+    report(title, md_table(cell))
+    return lt
+
+LT_ALL = show_table(HEAD_LODO + V1_AVAIL, "RQ2 - LODO macro-F1 on held-out ID classes, all models (mean ± sd over seeds)",
+                    "lodo_macro_f1_all.csv")
+show_table([M_(v, MAIN_FM) for v in HEAD_VARIANTS if v != "SERA-5"],
+           f"RQ2 - SERA ablation on {MAIN_FM} (LODO macro-F1)", "lodo_ablation.csv",
+           order=[M_(v, MAIN_FM) for v in HEAD_VARIANTS if v != "SERA-5"])
+show_table([M_(v, fm) for fm in FMS for v in ("LP-global", "SERA", "SERA-5")],
+           "RQ2 - does SERA help every encoder? (LODO macro-F1)", "lodo_by_encoder.csv")
+##CELL code
+# ---- in-domain CV -> degradation (RQ1)
+def cv_indomain(model):
+    gi, gp = [], []
+    for k in range(CV_FOLDS):
+        r = load_any(model, "cv", f"fold{k}", 0)
+        if r is None:
+            return None
+        gi.append(r["test_idx"]); gp.append(r["classes"][r["test_logits"].argmax(1)])
+    gi, gp = np.concatenate(gi), np.concatenate(gp)
+    out = {}
+    for held in dss:
+        shared = set(Y_ALL[SPLITS[("lodo", held)]["test_id"]].tolist())
+        msk = (idx.dataset.values[gi] == held) & np.isin(Y_ALL.numpy()[gi], list(shared))
+        if msk.any():
+            out[held] = f1_macro_np(Y_ALL.numpy()[gi][msk], gp[msk], np.array(sorted(shared)))
+    return out
+
+deg_rows = []
+for m in CV_HEADS + V1_AVAIL:
+    ind = cv_indomain(m)
+    if not ind:
+        continue
+    for h, v in ind.items():
+        lo = [EV[k]["macro_f1"] for k in EV if k[0] == m and k[1] == h]
+        if lo:
+            deg_rows.append(dict(model=m, held_out=h, in_domain=v, lodo=np.mean(lo), drop_points=100 * (v - np.mean(lo))))
+deg = pd.DataFrame(deg_rows)
+if len(deg):
+    deg.to_csv(TABLES / "degradation.csv", index=False)
+    dp = deg.pivot(index="model", columns="held_out", values="drop_points"); dp["mean"] = dp.mean(axis=1)
+    report("RQ1 - in-domain minus LODO macro-F1 (percentage points)", md_table(dp.sort_values("mean"), "{:.1f}"))
+##CELL code
+# ---- statistics: proposed vs every other model
+def hier_boot(A, B, n_boot=1000, seed=0):
+    rng = np.random.default_rng(seed)
+    pre = []
+    for h in dss:
+        ea = [EV[k] for k in sorted(EV) if k[0] == A and k[1] == h]
+        eb = [EV[k] for k in sorted(EV) if k[0] == B and k[1] == h]
+        if not ea or not eb:
+            continue
+        y = ea[0]["y"]; labels = np.unique(y)
+        _, ginv = np.unique(ea[0]["groups"], return_inverse=True)
+        members = [np.where(ginv == g)[0] for g in range(ginv.max() + 1)]
+        pre.append((y, labels, members, [e["pred"] for e in ea], [e["pred"] for e in eb]))
+    if not pre:
+        return None
+    point = np.mean([np.mean([f1_macro_np(y, p, l) for p in pa]) - np.mean([f1_macro_np(y, p, l) for p in pb])
+                     for y, l, _, pa, pb in pre])
+    D = np.empty(n_boot)
+    for b in range(n_boot):
+        diffs = []
+        for y, l, members, pa, pb in pre:
+            ix = np.concatenate([members[g] for g in rng.integers(0, len(members), len(members))])
+            fa = np.mean([f1_macro_np(y[ix], pa[i][ix], l) for i in rng.integers(0, len(pa), len(pa))])
+            fb = np.mean([f1_macro_np(y[ix], pb[i][ix], l) for i in rng.integers(0, len(pb), len(pb))])
+            diffs.append(fa - fb)
+        D[b] = np.mean(diffs)
+    lo, hi = np.percentile(D, [2.5, 97.5])
+    return point, lo, hi, min(1.0, 2 * min((D <= 0).mean(), (D >= 0).mean())), len(pre)
+
+stat_rows = []
+for B in [m for m in HEAD_LODO + V1_AVAIL if m != PROPOSED]:
+    res = hier_boot(PROPOSED, B, n_boot=100 if SMOKE else 1000)
+    if res is None:
+        continue
+    point, lo, hi, p_b, nh = res
+    pairs = [(EV[(PROPOSED, h, s)]["macro_f1"], EV[(B, h, s)]["macro_f1"]) for h in dss for s in ALL_SEEDS
+             if (PROPOSED, h, s) in EV and (B, h, s) in EV]
+    try:
+        p_w = stats.wilcoxon(*np.array(pairs).T).pvalue if len(pairs) >= 6 and np.any(np.diff(np.array(pairs), axis=1)) else np.nan
+    except ValueError:
+        p_w = np.nan
+    stat_rows.append(dict(baseline=B, diff_macro_f1=point, ci_low=lo, ci_high=hi, p_bootstrap=p_b,
+                          wilcoxon_p=p_w, paired_runs=len(pairs), held_out_sets=nh))
+STAT = pd.DataFrame(stat_rows)
+if len(STAT):
+    STAT["p_bootstrap_holm"] = holm(STAT.p_bootstrap.values)
+    STAT["ci_excludes_0"] = (STAT.ci_low > 0) | (STAT.ci_high < 0)
+    STAT["significant"] = STAT.p_bootstrap_holm < 0.05          # Holm-corrected over all comparisons (v4)
+    STAT = STAT.sort_values("diff_macro_f1").reset_index(drop=True)
+    STAT.to_csv(TABLES / "stats_proposed_vs_all.csv", index=False)
+    report(f"Statistics - {PROPOSED} minus each model (hierarchical bootstrap over photo groups and seeds)", md_table(STAT, "{:.4f}"))
+
+# per-class F1 for the focus models
+best_ft = (max([m for m in V1_AVAIL if m in FT_BACKBONE], key=lambda m: lodo_table([m]).macro_f1.mean())
+           if any(m in FT_BACKBONE for m in V1_AVAIL) else None)
+FOCUS = [m for m in [PROPOSED, M_("MIL", MAIN_FM), M_("LP-global+CCE", MAIN_FM), BASE_HEAD, best_ft, "SILA-Net"] if m]
+pc_rows = [dict(model=m, held_out=h, seed=s, **{f"F1_{c}": v for c, v in ev["per_class"].items()})
+           for (m, h, s), ev in EV.items() if m in FOCUS]
+if pc_rows:
+    pc = pd.DataFrame(pc_rows).groupby(["model", "held_out"]).mean(numeric_only=True).drop(columns="seed")
+    pc.to_csv(TABLES / "per_class_f1_focus.csv")
+    report("Per-class F1 on held-out sets (focus models, mean over seeds)", md_table(pc))
+##CELL md
+## 12. Risk-controlled treatment gate (RQ3)
+A remedy group is **issued** when the gate accepts the image; otherwise the app says *"uncertain: re-take a close, well-lit photo or ask the extension officer"*. The controlled quantity is the **wrong-remedy risk** R = P(issue ∧ issued group ≠ true group) over *all* images of a new source, including diseases the model never saw. An unseen disease whose treatment group is known (e.g. botrytis → fungal foliar) counts as correct when that group is issued.
+
+**Risk scores** (higher = riskier), each converted to validation-quantile units *u* = F_val(score) so that thresholds transfer between models:
+- `MSP` = 1 − max disease probability; `Remedy` = 1 − max remedy-group probability (temperature-scaled on source validation);
+- `kNN` = mean cosine distance to the 10 nearest training embeddings (catches confident errors far from the training data);
+- `Remedy+kNN` = max(u_Remedy, u_kNN): withhold if *either* signal is unusual.
+
+**Calibration of the threshold λ (accept iff u ≤ λ)** by conformal risk control (Angelopoulos et al., ICLR 2024) with loss 1[u ≤ λ ∧ wrong]:
+- `val-CRC`: on the pooled source validation split (assumes the test source looks like training; v1 shows it does not);
+- **`LOSO-CRC` (ours)**: on the *out-of-source* predictions of the leave-one-source-out models (each training source scored by a model that never saw it). The finite-sample-corrected risk is averaged over sources. This targets the risk on a *new* source under source-level exchangeability (Dunn et al., *JASA* 2023), approximate with 3 training sources;
+- `LOSO-CRC-worst`: the same with the maximum over sources (conservative).
+- For continuity with v1: `CP-remedy(val)`, i.e. issue only if the 90% conformal remedy set is a singleton.
+
+Reported per model × score × calibration, averaged with **equal weight over held-out sets and seeds**: acceptance, **risk** (target ε = 5%), **violation rate** (share of held-out × seed runs with risk > ε), wrong rate among issued remedies, unseen diseases withheld. Separately, *ranking quality* of each score: AURC and wrong-remedy rate among issued at **matched acceptance** (30%, 50%), and AUROC for unseen vs seen diseases.
+##CELL code
+from sklearn.metrics import roc_auc_score
+
+def decision_view(r, proto):
+    classes = r["classes"]
+    g2l = {g: i for i, g in enumerate(classes)}
+    yv = Y_ALL[r["val_idx"]].numpy(); yv_l = np.array([g2l[g] for g in yv])
+    T = fit_temperature(r["val_logits"], yv_l)
+    pv, pt = softmax(r["val_logits"], T), softmax(r["test_logits"], T)
+    Pv, Pt = group_probs(pv, classes), group_probs(pt, classes)
+    gv, gt = CLASS_GROUP[yv], g_of(proto, r["test_idx"])
+    raw = {"MSP": (1 - pv.max(1), 1 - pt.max(1)), "Remedy": (1 - Pv.max(1), 1 - Pt.max(1))}
+    if "val_knn" in r:
+        raw["kNN"] = (r["val_knn"], r["test_knn"])
+    U = {k: (cdf_of(v, v), cdf_of(v, t)) for k, (v, t) in raw.items()}
+    if "kNN" in U:
+        U["Remedy+kNN"] = (np.maximum(U["Remedy"][0], U["kNN"][0]), np.maximum(U["Remedy"][1], U["kNN"][1]))
+    qr = conf_quantile(1 - Pv[np.arange(len(gv)), gv], ALPHA)
+    rset = (1 - Pt) <= qr
+    yt = y_of(proto, r["test_idx"])
+    return dict(T=T, U=U, wrong_v=Pv.argmax(1) != gv, wrong_t=Pt.argmax(1) != gt, issued_t=Pt.argmax(1), true_g=gt,
+                cp_accept=rset.sum(1) == 1, cp_wrong=(rset.sum(1) == 1) & (rset.argmax(1) != gt),
+                unseen=~np.isin(yt, classes), pt=pt, classes=classes, y=yt)
+
+def crc_lambda(u_list, wrong_list, eps=RISK_EPS, mode="mean"):
+    """Conformal risk control for L(lam) = 1[u <= lam and wrong] (monotone in lam). Per calibration source the
+    finite-sample bound is n/(n+1) * R_n(lam) + 1/(n+1); sources are averaged (mode='mean') or the worst is used
+    ('max'). Returns the largest lam meeting eps, or -1 (accept nothing)."""
+    grid = np.unique(np.concatenate([[0.0, 1.0]] + [np.asarray(u) for u in u_list]))
+    risks = []
+    for u, w in zip(u_list, wrong_list):
+        n = len(u)
+        if n == 0:
+            continue
+        uw = np.sort(np.asarray(u)[np.asarray(w)])
+        risks.append(n / (n + 1) * np.searchsorted(uw, grid, side="right") / n + 1 / (n + 1))
+    if not risks:
+        return -1.0
+    agg = np.mean(risks, 0) if mode == "mean" else np.max(risks, 0)
+    ok = np.where(agg <= eps)[0]
+    return float(grid[ok[-1]]) if len(ok) else -1.0
+
+def calib_views(model, proto, split, seed):
+    """Out-of-source decision views used by LOSO-CRC: inner models (LODO) or the LODO models themselves (external)."""
+    if proto == "lodo":
+        cal = [("inner", f"{split}|{s}") for s in dss if s != split]
+    elif proto == "ext":
+        cal = [("lodo", s) for s in dss]
+    else:
+        return None
+    views = []
+    for p2, sp2 in cal:
+        r = load_any(model, p2, sp2, seed)
+        if r is None:
+            return None
+        views.append(decision_view(r, p2))
+    return views
+
+def gate_rows(model, proto, split, seed, require_loso=False):
+    """All calibrations of one run. require_loso=True skips runs without out-of-source calibration data, so that
+    every calibration of a model is averaged over exactly the same runs."""
+    r = load_any(model, proto, split, seed)
+    if r is None:
+        return [], []
+    lv = calib_views(model, proto, split, seed)
+    if require_loso and not lv:
+        return [], []
+    dv = decision_view(r, proto)
+    S = SPLITS[(proto, split)]
+    idm = np.isin(r["test_idx"], S["test_id"])
+    base = dict(model=model, proto=proto, held_out=split, seed=seed)
+    rows, rank = [], []
+    def add(score, cal, accept, lam=np.nan):
+        wrong = accept & dv["wrong_t"]
+        rows.append(dict(base, score=score, calibration=cal, lam=lam, accept=accept.mean(),
+                         accept_id=accept[idm].mean() if idm.any() else np.nan,
+                         risk=wrong.mean(), violation=float(wrong.mean() > RISK_EPS),
+                         wrong_among_issued=wrong.sum() / max(1, accept.sum()),
+                         withheld_unseen=(~accept[dv["unseen"]]).mean() if dv["unseen"].any() else np.nan,
+                         n=len(accept)))
+    add("-", "no gate", np.ones(len(dv["wrong_t"]), bool))
+    add("Remedy-set", "CP-remedy(val)", dv["cp_accept"])
+    for score, (uv, ut) in dv["U"].items():
+        lam = crc_lambda([uv], [dv["wrong_v"]]); add(score, "val-CRC", ut <= lam, lam)
+        if lv:
+            for mode, name in (("mean", "LOSO-CRC"), ("max", "LOSO-CRC-worst")):
+                lam = crc_lambda([v["U"][score][1] for v in lv], [v["wrong_t"] for v in lv], mode=mode)
+                add(score, name, ut <= lam, lam)
+        rr = dict(base, score=score, aurc=aurc(-ut, ~dv["wrong_t"]),
+                  auroc_unseen=roc_auc_score(dv["unseen"], ut) if 0 < dv["unseen"].sum() < len(ut) else np.nan)
+        for a in MATCHED_ACCEPT:
+            thr = np.quantile(ut, a); acc = ut <= thr
+            rr[f"wrong_among_issued@{int(a * 100)}%"] = (acc & dv["wrong_t"]).sum() / max(1, acc.sum())
+        rank.append(rr)
+    return rows, rank
+
+GATE_FOCUS = list(dict.fromkeys(GATE_MODELS + [m for m in FT_GATE_MODELS if m in V1_AVAIL] +
+                                [M_("MIL", MAIN_FM), M_("LP-global+CCE", MAIN_FM)] +
+                                [m for m in ["EfficientNetB0", "ConvNeXtT", "ViTS", "SILA-Net", "FM:DINOv2-B", "FM:DINOv3-B"]
+                                 if m in V1_AVAIL]))
+G_ROWS, R_ROWS = [], []
+for m in tqdm(GATE_FOCUS, desc="gates"):
+    has_loso = any(calib_views(m, "lodo", h, s) for h in dss for s in ALL_SEEDS if load_any(m, "lodo", h, s) is not None)
+    for h in dss:
+        for s in ALL_SEEDS:
+            a, b = gate_rows(m, "lodo", h, s, require_loso=has_loso); G_ROWS += a; R_ROWS += b
+GT, RK = pd.DataFrame(G_ROWS), pd.DataFrame(R_ROWS)
+if len(GT):
+    GT.to_csv(TABLES / "gate_all_runs.csv", index=False); RK.to_csv(TABLES / "gate_score_ranking_all_runs.csv", index=False)
+    GAGG = (GT.groupby(["model", "score", "calibration"])
+              .agg(accept=("accept", "mean"), accept_id=("accept_id", "mean"), risk=("risk", "mean"),
+                   violation_rate=("violation", "mean"), wrong_among_issued=("wrong_among_issued", "mean"),
+                   withheld_unseen=("withheld_unseen", "mean"), runs=("risk", "size")))
+    GAGG.to_csv(TABLES / "gate_summary.csv")
+    report(f"RQ3 - gate summary for {PROPOSED} (target risk eps = {RISK_EPS:.0%}; mean over held-out sets and seeds)",
+           md_table(GAGG.loc[PROPOSED] if PROPOSED in GAGG.index.get_level_values(0) else GAGG.head(0), "{:.3f}"))
+    report("RQ3 - gate summary, all focus models", md_table(GAGG, "{:.3f}"))
+    RAGG = RK.groupby(["model", "score"]).mean(numeric_only=True).drop(columns=["seed"], errors="ignore")
+    RAGG.to_csv(TABLES / "gate_score_ranking.csv")
+    report("RQ3 - ranking quality of the risk scores (lower AURC / wrong-at-matched-acceptance is better)", md_table(RAGG, "{:.3f}"))
+##CELL code
+# headline + figures
+if len(GT) and PROPOSED in set(GT.model):
+    g = GAGG.loc[PROPOSED]
+    def row_(score, cal):
+        return g.loc[(score, cal)] if (score, cal) in g.index else None
+    lines = []
+    ng = row_("-", "no gate")
+    if ng is not None:
+        lines.append(f"- no gate: wrong-remedy risk **{ng.risk:.1%}** of all held-out images")
+    for score, cal in [("MSP", "val-CRC"), ("Remedy", "val-CRC"), ("Remedy-set", "CP-remedy(val)"),
+                       ("Remedy", "LOSO-CRC"), ("Remedy+kNN", "LOSO-CRC"), ("Remedy+kNN", "LOSO-CRC-worst")]:
+        r_ = row_(score, cal)
+        if r_ is not None:
+            lines.append(f"- {score} / {cal}: risk {r_.risk:.1%} (violations {r_.violation_rate:.0%} of runs), "
+                         f"accepts {r_.accept:.0%} of images, {r_.wrong_among_issued:.0%} of issued remedies wrong, "
+                         f"withholds {r_.withheld_unseen:.0%} of unseen diseases")
+    if CROP == "onion":
+        lines.append("- v1 reference (SILA-Net, cross-source conformal level): accepted 11%, 23% of issued remedies wrong")
+    report(f"RQ3 headline ({PROPOSED})", "\n".join(lines))
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.2))
+    mk = {"val-CRC": "o", "LOSO-CRC": "*", "LOSO-CRC-worst": "P", "CP-remedy(val)": "s", "no gate": "x"}
+    for (score, cal), r_ in g.iterrows():
+        axes[0].scatter(r_.accept, r_.risk, marker=mk.get(cal, "o"), s=140 if cal == "LOSO-CRC" else 60, label=f"{score} / {cal}")
+    axes[0].axhline(RISK_EPS, color="k", ls="--", lw=1); axes[0].set_xlabel("acceptance (all held-out images)")
+    axes[0].set_ylabel("wrong-remedy risk"); axes[0].set_title(PROPOSED, fontsize=10)
+    axes[0].legend(fontsize=6, loc="upper left")
+    # selective wrong-remedy curves (seed 0, pooled over held-out sets with equal weight)
+    for m, score, ls in [(PROPOSED, "Remedy+kNN", "-"), (PROPOSED, "Remedy", "--"), (PROPOSED, "MSP", ":"), (BASE_HEAD, "MSP", "-.")]:
+        curves = []
+        for h in dss:
+            r = load_any(m, "lodo", h, HEAD_SEEDS[0])
+            if r is None:
+                continue
+            dv = decision_view(r, "lodo")
+            if score not in dv["U"]:
+                continue
+            ut = dv["U"][score][1]; o = np.argsort(ut, kind="stable")
+            cov = np.linspace(0.02, 1, 50)
+            curves.append([dv["wrong_t"][o][:max(1, int(c * len(o)))].mean() for c in cov])
+        if curves:
+            axes[1].plot(np.linspace(0.02, 1, 50), np.mean(curves, 0), ls=ls, label=f"{m} / {score}")
+    axes[1].set_xlabel("acceptance"); axes[1].set_ylabel("wrong remedies among issued"); axes[1].legend(fontsize=7)
+    axes[1].set_title("selective risk curves (seed 0, mean over held-out sets)", fontsize=10)
+    plt.tight_layout(); plt.savefig(FIGS / "rq3_gate.png", dpi=120); plt.show()
+##CELL code
+# single-source reference splits (if configured): accuracy and gate (only val-CRC is possible with ONE training source,
+# because leave-one-source-out calibration needs >= 2 training sources)
+single_keys = [k for k in SPLITS if k[0] == "single"]
+if single_keys:
+    acc_rows, sg_rows = [], []
+    for (_, name_) in single_keys:
+        for m in GATE_MODELS:
+            for s in INNER_SEEDS:
+                r = load_any(m, "single", name_, s)
+                if r is None:
+                    continue
+                ev = eval_test(r, "single", name_)
+                acc_rows.append(dict(split=name_, model=m, seed=s, macro_f1=ev["macro_f1"], acc=ev["acc"]))
+                sg_rows += gate_rows(m, "single", name_, s)[0]
+    if acc_rows:
+        report("Single-source reference splits - accuracy (seen classes)",
+               md_table(pd.DataFrame(acc_rows).groupby(["split", "model"]).agg(macro_f1=("macro_f1", "mean"), macro_f1_sd=("macro_f1", "std"), acc=("acc", "mean"), seeds=("seed", "size")).reset_index()))
+    if sg_rows:
+        sg = pd.DataFrame(sg_rows)
+        sg.to_csv(TABLES / "gate_single_source.csv", index=False)
+        report(f"Single-source reference splits - gate (target risk {RISK_EPS:.0%})",
+               md_table(sg.groupby(["held_out", "model", "score", "calibration"])[["accept", "risk", "wrong_among_issued",
+                                                                                   "withheld_unseen"]].mean(), "{:.3f}"))
+##CELL md
+### 12.1 What the app would say (worked cases, proposed model, `Remedy+kNN` / `LOSO-CRC`)
+Action texts are **templates that agronomists must verify** before any field use. They are not advice.
+##CELL code
+cases = []
+for h in dss:
+    r = load_any(PROPOSED, "lodo", h, HEAD_SEEDS[0]); lv = calib_views(PROPOSED, "lodo", h, HEAD_SEEDS[0])
+    if r is None or not lv:
+        continue
+    dv = decision_view(r, "lodo")
+    lam = crc_lambda([v["U"]["Remedy+kNN"][1] for v in lv], [v["wrong_t"] for v in lv])
+    ut = dv["U"]["Remedy+kNN"][1]; acc = ut <= lam
+    kinds = {"issued & right": acc & ~dv["wrong_t"], "withheld (would have been wrong)": ~acc & dv["wrong_t"],
+             "withheld unseen disease": ~acc & dv["unseen"], "issued & WRONG (failure)": acc & dv["wrong_t"]}
+    for kind, msk in kinds.items():
+        w_ = np.where(msk)[0]
+        if len(w_):
+            i = w_[0]
+            cases.append(dict(held_out=h, case=kind, true=CLASSES[dv["y"][i]] if dv["y"][i] >= 0 else "?",
+                              top_disease=CLASSES[dv["classes"][dv["pt"][i].argmax()]], issued_group=GROUPS[dv["issued_t"][i]],
+                              decision="ISSUE" if acc[i] else "WITHHOLD", u_risk=float(ut[i]), lam=lam,
+                              message=ACTION[GROUPS[dv["issued_t"][i]]] if acc[i] else
+                              "Uncertain: re-take a close, well-lit photo of the affected leaf, or consult the extension officer.",
+                              file=idx.rel[int(r["test_idx"][i])]))
+if cases:
+    cs = pd.DataFrame(cases); cs.to_csv(TABLES / "gate_case_studies.csv", index=False)
+    report("Worked cases (UNVERIFIED action templates)", md_table(cs.drop(columns=["message", "file"])))
+##CELL md
+## 13. Explanations that are tested (RQ4)
+SERA's attention over the 14 views is a built-in explanation: *which part of the photo, at which zoom, carried the decision*. Instead of judging heat maps by eye, we test it:
+- **Bag deletion faithfulness**: remove the *k* most-attended views (k = 1…4) and measure the drop in the predicted class probability, against removing *k* random views (5 draws). Faithful attention → larger drop.
+- **Keep-only-top-k**: keep only the *k* most-attended views. A faithful explanation should keep most of the probability.
+- **Correct vs wrong** cross-source predictions: attention entropy, share on the global view, share on the finest tiles (Mann–Whitney U).
+- **Lesion pointing** (if `lesion_masks/` from the v1 annotation pack is attached): the lesion fraction in the most-attended tile divided by the mean lesion fraction over tiles (lift > 1 = attention points at lesions), and the hit rate.
+- Comparison: SERA vs MIL without erasure (same seed).
+##CELL code
+def find_mask_dir(name):
+    if not INPUT_ROOT.exists():
+        return None
+    for p in INPUT_ROOT.rglob(name):
+        if p.is_dir():
+            return p
+    return None
+MASKS_A = find_mask_dir("lesion_masks")
+
+def mask_tile_frac(i):
+    if MASKS_A is None:
+        return None
+    for ext_ in (".png", ".jpg"):
+        f = MASKS_A / f"{uid_of(i)}{ext_}"
+        if f.exists():
+            m = np.asarray(Image.open(f).convert("L").resize((TILE_CANVAS, TILE_CANVAS), Image.NEAREST)) > 127
+            return np.array([m[y0:y1, x0:x1].mean() for (x0, y0, x1, y1) in TILE_BOXES]) if m.any() else None
+    return None
+
+XAI_ROWS, DEL_ROWS, ATT_EXAMPLES = [], [], {}
+rng_x = np.random.default_rng(0)
+for m in [PROPOSED, M_("MIL", MAIN_FM)]:
+    for h in dss:
+        r = build_and_train(m, "lodo", h, HEAD_SEEDS[0], keep_X=True)
+        S = SPLITS[("lodo", h)]
+        pos = {g: i for i, g in enumerate(r["test_idx"])}
+        sel = np.array([pos[g] for g in S["test_id"]], dtype=int)
+        X = r["X"][2][torch.as_tensor(sel, device=DEVICE)]
+        model, classes = r["model"], r["classes"]
+        logits, att, _ = head_forward(model, X)
+        p0 = softmax(logits); pred = p0.argmax(1); pp = p0[np.arange(len(pred)), pred]
+        y = np.searchsorted(classes, Y_ALL[S["test_id"]].numpy())
+        Tn = X.shape[1]
+        order = np.argsort(-att, axis=1)
+        for k in range(1, 5):
+            for mode in ("top", "random", "keep-top"):
+                draws = 1 if mode != "random" else 5
+                drops = []
+                for _ in range(draws):
+                    keep = np.ones((len(pred), Tn), bool)
+                    if mode == "top":
+                        np.put_along_axis(keep, order[:, :k], False, 1)
+                    elif mode == "random":
+                        rnd = np.argsort(rng_x.random((len(pred), Tn)), 1)[:, :k]
+                        np.put_along_axis(keep, rnd, False, 1)
+                    else:
+                        keep[:] = False; np.put_along_axis(keep, order[:, :k], True, 1)
+                    lk = head_forward(model, X, keep=torch.as_tensor(keep, device=DEVICE))[0]
+                    drops.append(pp - softmax(lk)[np.arange(len(pred)), pred])
+                DEL_ROWS.append(dict(model=m, held_out=h, k=k, mode=mode, prob_drop=float(np.mean(drops))))
+        ent = -(att * np.log(att + 1e-12)).sum(1) / np.log(Tn)
+        fine = att[:, TILE_SCALE[:Tn] == max(TILE_GRIDS)].sum(1)
+        for j, i in enumerate(S["test_id"]):
+            row = dict(model=m, held_out=h, i=int(i), correct=bool(pred[j] == y[j]), entropy=ent[j],
+                       global_share=att[j, 0], finest_share=fine[j], p_pred=pp[j])
+            fr = mask_tile_frac(int(i)) if j < XAI_SAMPLES else None
+            if fr is not None:
+                t_ = int(np.argmax(att[j, 1:])) + 1
+                row["lesion_lift"] = fr[t_] / (fr[1:].mean() + 1e-8)
+                row["lesion_hit"] = float(fr[t_] >= fr[1:].max() - 1e-9)
+            XAI_ROWS.append(row)
+        if m == PROPOSED:
+            ATT_EXAMPLES[h] = (S["test_id"], att, pred, y, classes)
+        del r, X; torch.cuda.empty_cache()
+
+dl = pd.DataFrame(DEL_ROWS)
+if len(dl):
+    dl.to_csv(TABLES / "xai_bag_deletion.csv", index=False)
+    dpv = dl.groupby(["model", "mode", "k"]).prob_drop.mean().unstack("k")
+    report("RQ4 - probability drop when views are removed (top-attended vs random; keep-top = only top-k kept)", md_table(dpv))
+xa = pd.DataFrame(XAI_ROWS)
+if len(xa):
+    xa.to_csv(TABLES / "xai_attention_per_image.csv", index=False)
+    cols = [c for c in ["entropy", "global_share", "finest_share", "lesion_lift", "lesion_hit"] if c in xa]
+    report("RQ4 - attention statistics (held-out ID images, seed 0)", md_table(xa.groupby(["model", "correct"])[cols].mean()))
+    fa = []
+    for m, g_ in xa.groupby("model"):
+        if g_.correct.nunique() < 2:
+            continue
+        for metric in ["entropy", "global_share", "finest_share"]:
+            a_, b_ = g_[g_.correct][metric], g_[~g_.correct][metric]
+            fa.append(dict(model=m, metric=metric, correct_mean=a_.mean(), wrong_mean=b_.mean(),
+                           mannwhitney_p=stats.mannwhitneyu(a_, b_).pvalue))
+    if fa:
+        fa = pd.DataFrame(fa); fa.to_csv(TABLES / "xai_correct_vs_wrong.csv", index=False)
+        report("RQ4 - attention of correct vs wrong cross-source predictions", md_table(fa, "{:.4f}"))
+##CELL code
+# figure: where SERA looks (sum of tile attention over the canvas, global-view share in the title)
+show = []
+for h, (tid, att, pred, y, classes) in ATT_EXAMPLES.items():
+    ok, bad = np.where(pred == y)[0], np.where(pred != y)[0]
+    show += [(h, tid, att, pred, y, classes, j) for j in list(ok[:1]) + list(bad[:1])]
+if show:
+    fig, axes = plt.subplots(2, len(show), figsize=(2.3 * len(show), 4.8), squeeze=False)
+    for c_, (h, tid, att, pred, y, classes, j) in enumerate(show):
+        i = int(tid[j]); img = CACHE[i].transpose(1, 2, 0)
+        heat = np.zeros((TILE_CANVAS, TILE_CANVAS))
+        for t_, (x0, y0, x1, y1) in enumerate(TILE_BOXES[:att.shape[1]]):
+            if t_ > 0:
+                heat[y0:y1, x0:x1] += att[j, t_]
+        heat = np.asarray(Image.fromarray((255 * heat / (heat.max() + 1e-8)).astype(np.uint8)).resize((CACHE_SIZE, CACHE_SIZE)))
+        axes[0, c_].imshow(img); axes[0, c_].axis("off")
+        axes[0, c_].set_title(f"{h[:12]}\ntrue {CLASSES[classes[y[j]]][:12]}", fontsize=7)
+        axes[1, c_].imshow(img); axes[1, c_].imshow(heat, cmap="jet", alpha=0.45); axes[1, c_].axis("off")
+        axes[1, c_].set_title(f"pred {CLASSES[classes[pred[j]]][:12]}\nglobal view {att[j, 0]:.2f}", fontsize=7)
+    plt.tight_layout(); plt.savefig(FIGS / "xai_sera_attention.png", dpi=120); plt.show()
+##CELL md
+## 14. Efficiency (on-device readiness)
+Encoder cost per view (GFLOPs, params) and CPU latency (4 threads, a rough stand-in for a mid-range phone) for 1, 5 and 14 views. The heads are negligible (< 0.3 M parameters). ONNX export of the phone-sized encoder for later TFLite conversion.
+##CELL code
+from torch.utils.flop_counter import FlopCounterMode
+eff = []
+for fm in dict.fromkeys([EDGE_FM, MAIN_FM]):
+    try:
+        enc, mean, std, counted = load_encoder(FM_ENCODERS[fm]); enc = enc.cpu().eval()
+    except Exception as e:
+        print(fm, "unavailable:", e); continue
+    x1 = torch.rand(1, 3, IMG_SIZE, IMG_SIZE)
+    try:
+        with FlopCounterMode(display=False) as fc, torch.no_grad():
+            enc(x1)
+        gfl = fc.get_total_flops() / 2e9
+    except Exception:
+        gfl = np.nan
+    torch.set_num_threads(4)
+    for nt in (1, 5, N_TILES):
+        x = torch.rand(nt, 3, IMG_SIZE, IMG_SIZE); ts = []
+        with torch.no_grad():
+            enc(x)
+            for _ in range(2 if SMOKE else 7):
+                t = time.perf_counter(); enc(x); ts.append(time.perf_counter() - t)
+        eff.append(dict(encoder=fm, views=nt, params_M=count_params(counted), GFLOPs=gfl * nt, cpu_ms=1000 * np.median(ts)))
+    if fm == EDGE_FM:
+        for dyn in (False, True):     # legacy tracer first; DINOv3's attention may need the torch.export path
+            try:
+                torch.onnx.export(enc, (x1,), str(RES / f"{fm}_encoder.onnx"), input_names=["image_normalized"],
+                                  output_names=["embedding"], opset_version=17 if not dyn else 18, dynamo=dyn)
+                print("ONNX exported:", RES / f"{fm}_encoder.onnx", "| dynamo =", dyn); break
+            except Exception as e:
+                print(f"ONNX export (dynamo={dyn}) failed:", str(e)[:160])
+    del enc; gc.collect()
+if eff:
+    eff = pd.DataFrame(eff); eff.to_csv(TABLES / "efficiency.csv", index=False)
+    report("Efficiency (encoder; 224x224 views; CPU 4 threads)", md_table(eff, "{:.2f}"))
+##CELL md
+## 15. Blinded expert label audit (RQ1)
+D3 can only *flag* classes whose same-named labels look different across sources. Whether that is a labelling error, a different disease stage, or a genuinely different pathogen needs a plant pathologist. This cell exports `expert_audit_pack/` with `AUDIT_PER_CELL` images per (source, class) under **random ids, without source or label**, and a sheet to fill.
+
+Upload the filled sheet as `audit_sheet_filled.csv` (any dataset, attached as input) and re-run. The agreement analysis below then fills itself in: per source and class, the share of images where the expert agrees with the dataset label, plus Cohen's κ per source.
+##CELL code
+pack = OUT / "expert_audit_pack"
+(pack / "images").mkdir(parents=True, exist_ok=True)
+sel_rows = []
+for (d, c), g_ in meta.groupby(["dataset", "label_name"]):
+    sel_rows += list(g_.sample(min(AUDIT_PER_CELL, len(g_)), random_state=7).index)
+order_ = np.random.default_rng(7).permutation(len(sel_rows))
+key_rows, sheet_rows = [], []
+for n_, j in enumerate(order_):
+    i = int(sel_rows[j]); src_f = Path(idx.path[i]); aid = f"A{n_:04d}"
+    shutil.copy2(src_f, pack / "images" / f"{aid}{src_f.suffix.lower()}")
+    sheet_rows.append(dict(audit_id=aid, file=f"{aid}{src_f.suffix.lower()}", expert_label="", expert_confidence_1to3="", notes=""))
+    key_rows.append(dict(audit_id=aid, dataset=idx.dataset[i], source_class=idx.source_class[i], label_name=idx.label_name[i], rel=idx.rel[i]))
+pd.DataFrame(sheet_rows).to_csv(pack / "audit_sheet.csv", index=False)
+pd.DataFrame(key_rows).to_csv(OUT / "expert_audit_KEY_do_not_share.csv", index=False)
+(pack / "README.txt").write_text(
+    "For each image, write the disease you see in expert_label, using one of:\n  " + ", ".join(sorted(REMEDY_GROUP)) +
+    ", other, unsure\nConfidence: 1 = guess, 2 = probable, 3 = certain. Use notes for co-infection or stage.\n"
+    "Do not look up where the images come from. Return the filled sheet as audit_sheet_filled.csv.\n")
+print("audit pack:", pack, "|", len(sheet_rows), "images")
+
+filled = next(iter(INPUT_ROOT.rglob("audit_sheet_filled.csv")), None) if INPUT_ROOT.exists() else None
+if filled is not None:
+    from sklearn.metrics import cohen_kappa_score
+    au = pd.read_csv(filled).merge(pd.DataFrame(key_rows), on="audit_id")
+    au["expert_label"] = au.expert_label.astype(str).str.strip().str.lower().str.replace(" ", "_")
+    au = au[au.expert_label.ne("") & au.expert_label.ne("nan")]
+    if MERGE_VIRAL:
+        au["expert_label"] = au.expert_label.replace({"iris_yellow_virus": "viral", "virosis": "viral"})
+    au["agree"] = au.expert_label == au.label_name
+    agr = au.groupby(["label_name", "dataset"]).agg(n=("agree", "size"), agreement=("agree", "mean"),
+                                                    expert_unsure=("expert_label", lambda s: s.isin(["unsure", "other"]).mean()))
+    agr.to_csv(TABLES / "expert_audit_agreement.csv")
+    kap = {d: cohen_kappa_score(g_.label_name, g_.expert_label) for d, g_ in au.groupby("dataset") if g_.label_name.nunique() > 1}
+    report("Expert audit - agreement between dataset labels and the blinded expert",
+           md_table(agr, "{:.2f}") + "\n\nCohen's kappa per source: " + ", ".join(f"{d}: {k:.2f}" for d, k in kap.items()))
+else:
+    print("no audit_sheet_filled.csv attached yet")
+##CELL md
+## 16. External prospective test (only if `onion_external/` is attached)
+Models trained on **all four** public sources and gated with LOSO-CRC, calibrated on the four LODO models' out-of-source predictions. Nothing is tuned on the external images.
+##CELL code
+if EXT is not None and ("ext", "all") in SPLITS:
+    er_rows, eg_rows = [], []
+    for m in GATE_MODELS:
+        for s in INNER_SEEDS:
+            r = load_any(m, "ext", "all", s)
+            if r is None:
+                continue
+            ev = eval_test(r, "ext", "all")
+            er_rows.append(dict(model=m, seed=s, macro_f1=ev["macro_f1"], acc=ev["acc"], **{f"F1_{c}": v for c, v in ev["per_class"].items()}))
+            a, _ = gate_rows(m, "ext", "all", s); eg_rows += a
+    if er_rows:
+        e1 = pd.DataFrame(er_rows).groupby("model").mean(numeric_only=True).drop(columns="seed")
+        e1.to_csv(TABLES / "external_accuracy.csv"); report("External test - accuracy (classes seen in training)", md_table(e1))
+    if eg_rows:
+        e2 = (pd.DataFrame(eg_rows).groupby(["model", "score", "calibration"])
+              [["accept", "risk", "violation", "wrong_among_issued", "withheld_unseen"]].mean())
+        e2.to_csv(TABLES / "external_gate.csv"); report("External test - gate", md_table(e2, "{:.3f}"))
+else:
+    print("no external set attached (optional)")
+##CELL md
+## 17. Report and archive
+##CELL code
+lines = [f"# {CROP.capitalize()} cross-source diagnosis (SERA pipeline): results report", "",
+         f"Generated {time.strftime('%Y-%m-%d %H:%M')} | {'SMOKE TEST' if SMOKE else 'full run'} | classes: {', '.join(CLASSES)} | "
+         f"main encoder {MAIN_FM} | proposed {PROPOSED} | head runs {len(list(HEADS.glob('*.json')))} | elapsed {hours():.2f} h", "",
+         "Figures: " + ", ".join(sorted(p.name for p in FIGS.glob('*.png'))), ""]
+for title, text in REPORT:
+    lines += [f"## {title}", "", text, ""]
+(RES / "REPORT.md").write_text("\n".join(lines), encoding="utf-8")
+save_json(dict(SMOKE=SMOKE, MERGE_VIRAL=MERGE_VIRAL, IMG_SIZE=IMG_SIZE, TILE_GRIDS=TILE_GRIDS, TILE_CANVAS=TILE_CANVAS,
+               FM_ENCODERS=FM_ENCODERS, MAIN_FM=MAIN_FM, EDGE_FM=EDGE_FM, HEAD_SEEDS=HEAD_SEEDS, INNER_SEEDS=INNER_SEEDS,
+               HEAD_EPOCHS=HEAD_EPOCHS, TILE_DROP=TILE_DROP, KNN_K=KNN_K, RISK_EPS=RISK_EPS, ALPHA=ALPHA,
+               classes=CLASSES, torch=torch.__version__, timm=timm.__version__, HEAD_TAG=HEAD_TAG, RUN_TAG=RUN_TAG),
+          RES / "config.json")
+with zipfile.ZipFile(OUT / "results_light.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+    for f in RES.rglob("*"):
+        if f.is_file() and f.suffix not in {".pt", ".npz", ".onnx", ".npy"}:
+            zf.write(f, f.relative_to(OUT))
+print("REPORT:", RES / "REPORT.md", "| archive:", OUT / "results_light.zip", f"| total time {hours():.2f} h")

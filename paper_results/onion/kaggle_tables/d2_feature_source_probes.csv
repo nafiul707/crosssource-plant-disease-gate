@@ -1,0 +1,22 @@
+target,subset,features,probe,balanced_acc,chance
+source,all images,raw,linear,0.9157141677783098,0.25
+source,all images,raw,MLP,0.9225340888819055,0.25
+source,within healthy,raw,linear,0.9555171914634621,0.25
+source,within healthy,raw,MLP,0.9505683308575696,0.25
+source,within purple_blotch,raw,linear,0.937952737382378,0.25
+source,within purple_blotch,raw,MLP,0.9367414456800685,0.25
+disease,all images,raw,linear,0.7415959993063885,0.09090909090909091
+source,all images,class-cond. LEACE,linear,0.5921307068990062,0.25
+source,all images,class-cond. LEACE,MLP,0.9080686912023398,0.25
+source,within healthy,class-cond. LEACE,linear,0.8765640761156543,0.25
+source,within healthy,class-cond. LEACE,MLP,0.9180127025439777,0.25
+source,within purple_blotch,class-cond. LEACE,linear,0.8052459842220321,0.25
+source,within purple_blotch,class-cond. LEACE,MLP,0.8119262902765897,0.25
+disease,all images,class-cond. LEACE,linear,0.7197913812416844,0.09090909090909091
+source,all images,global LEACE,linear,0.2582756887219476,0.25
+source,all images,global LEACE,MLP,0.9006085368897425,0.25
+source,within healthy,global LEACE,linear,0.9046330770406594,0.25
+source,within healthy,global LEACE,MLP,0.9353614590059081,0.25
+source,within purple_blotch,global LEACE,linear,0.7770179878338561,0.25
+source,within purple_blotch,global LEACE,MLP,0.8107814846497481,0.25
+disease,all images,global LEACE,linear,0.6737261544156021,0.09090909090909091

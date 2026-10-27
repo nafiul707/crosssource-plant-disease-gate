@@ -1,0 +1,225 @@
+##CELL md
+### 12.2 How robust is the gate? (anticipating reviewer questions)
+Everything below reuses the saved predictions of section 12; nothing is re-trained and no held-out label is used for any choice.
+1. **Risk-target sweep** (ε = 5 / 10 / 15 / 20%): how much more can be issued when a higher risk is tolerated?
+2. **Per held-out source**: the leave-one-source-out guarantee is an *average over new sources* (source-level exchangeability). It does not bound every single source, so we show each one.
+3. **Uncertainty**: 95% bootstrap intervals of risk and acceptance (photo groups resampled within each held-out source, seeds pooled).
+4. **Shift-aware alternatives** (the obvious competitors from the conformal literature), all at the same ε:
+   - `W-CRC`: **weighted** conformal risk control under covariate shift (Tibshirani et al., NeurIPS 2019; risk version). The density ratio target/validation is estimated by a logistic classifier on label-free per-image statistics (confidences, entropy, kNN distance) of the **unlabelled held-out images**. It uses target data, so it is a *transductive* competitor, more favourable than our method.
+   - `Robust-CRC(ρ)`: **distributionally robust** validation (Cauchois et al., *JASA* 2024). The validation risk is replaced by its worst case over all distributions within KL radius ρ, for ρ ∈ {0.01, 0.05, 0.1, 0.2}. ρ has to be guessed; no principled choice exists without data from other sources.
+   - `Energy` score (Liu et al., NeurIPS 2020) as an extra label-free risk score.
+5. **Fewer calibration sources**: `LOSO-CRC (2 src)` uses only two of the three out-of-source calibration sets (all three pairs, averaged). This shows how the gate degrades when fewer public sources exist.
+6. **Unseen-disease simulation** (`LOSO+LCO-CRC`, v4): leave-one-source-out calibration only sees the kinds of error that occur *between training sources*. When all training sources share the same diseases (potato with Indonesia held out), it never sees an unseen disease and under-estimates that risk. We therefore add **leave-one-class-out** copies of every inner split (section 7.2: one disease removed from inner training, so the inner held-out source's images of it are unseen) as extra calibration environments. `LOSO+LCO-CRC` averages the finite-sample bound over all environments; `-worst` takes the maximum. Frozen-encoder heads only (each copy trains in seconds).
+##CELL code
+import warnings
+from itertools import combinations
+warnings.filterwarnings("ignore", message="Mean of empty slice")
+from sklearn.linear_model import LogisticRegression
+from scipy.special import logsumexp
+
+EPS_GRID = [0.05, 0.10, 0.15, 0.20]
+RHO_GRID = [0.01, 0.05, 0.10, 0.20]
+ROB_SCORES = ["Remedy", "kNN", "Remedy+kNN", "Energy"]
+
+def kl_bern(q, p):
+    q = np.clip(q, 1e-12, 1 - 1e-12); p = np.clip(p, 1e-12, 1 - 1e-12)
+    return q * np.log(q / p) + (1 - q) * np.log((1 - q) / (1 - p))
+
+def kl_upper(p, rho, iters=40):
+    """Largest q >= p with KL(Bern(q) || Bern(p)) <= rho (vectorised bisection)."""
+    p = np.asarray(p, float); lo, hi = p.copy(), np.ones_like(p)
+    for _ in range(iters):
+        mid = (lo + hi) / 2; ok = kl_bern(mid, p) <= rho
+        lo = np.where(ok, mid, lo); hi = np.where(ok, hi, mid)
+    return lo
+
+def crc_curve(u, wrong, grid, w=None, w_test=None):
+    """Finite-sample CRC bound of L(lam) = 1[u <= lam and wrong] on the grid (optionally importance-weighted)."""
+    u = np.asarray(u); wrong = np.asarray(wrong, bool)
+    if w is None:
+        n = len(u); uw = np.sort(u[wrong])
+        return n / (n + 1) * np.searchsorted(uw, grid, side="right") / max(1, n) + 1 / (n + 1)
+    o = np.argsort(u[wrong]); uw = u[wrong][o]; cw = np.concatenate([[0.0], np.cumsum(w[wrong][o])])
+    return (cw[np.searchsorted(uw, grid, side="right")] + w_test) / (w.sum() + w_test)
+
+def pick(grid, bound, eps):
+    ok = np.where(bound <= eps)[0]
+    return float(grid[ok[-1]]) if len(ok) else -1.0
+
+def add_energy(dv, r):
+    """Energy score (higher = riskier) in validation-quantile units, temperature as in decision_view."""
+    ev, et = -dv["T"] * logsumexp(r["val_logits"] / dv["T"], 1), -dv["T"] * logsumexp(r["test_logits"] / dv["T"], 1)
+    dv["U"]["Energy"] = (cdf_of(ev, ev), cdf_of(ev, et))
+    return dv
+
+def view_of(model, proto, split, seed):
+    r = load_any(model, proto, split, seed)
+    return None if r is None else add_energy(decision_view(r, proto), r)
+
+def shift_features(dv, which):
+    """Label-free per-image statistics used by W-CRC to estimate the density ratio target / validation."""
+    i = 0 if which == "val" else 1
+    cols = [dv["U"][k][i] for k in ("MSP", "Remedy", "Energy", "kNN") if k in dv["U"]]
+    return np.column_stack(cols)
+
+def density_ratio(dv, clip=20.0):
+    Fv, Ft = shift_features(dv, "val"), shift_features(dv, "test")
+    X = np.vstack([Fv, Ft]); d = np.r_[np.zeros(len(Fv)), np.ones(len(Ft))]
+    clf = LogisticRegression(C=1.0, max_iter=1000).fit(X, d)
+    p = clf.predict_proba(Fv)[:, 1]
+    w = np.clip(p / (1 - p) * len(Fv) / len(Ft), 1 / clip, clip)
+    return w, float(w.max())
+
+def gate_stats(dv, accept, idm):
+    wrong = accept & dv["wrong_t"]
+    return dict(accept=accept.mean(), accept_id=accept[idm].mean() if idm.any() else np.nan, risk=wrong.mean(),
+                wrong_among_issued=wrong.sum() / max(1, accept.sum()),
+                withheld_unseen=(~accept[dv["unseen"]]).mean() if dv["unseen"].any() else np.nan)
+
+ROB_MODELS = [m for m in GATE_FOCUS
+              if any(calib_views(m, "lodo", h, s) for h in dss for s in ALL_SEEDS if load_any(m, "lodo", h, s) is not None)]
+print("models with leave-one-source-out calibration data:", ROB_MODELS)
+##CELL code
+ROB_ROWS, ROB_MASKS = [], {}      # ROB_MASKS[(model, score, cal, eps, held_out, seed)] = (accept, wrong) for the bootstrap
+for m in tqdm(ROB_MODELS, desc="gate robustness"):
+    for h in dss:
+        for s in ALL_SEEDS:
+            r = load_any(m, "lodo", h, s)
+            if r is None:
+                continue
+            cal = [view_of(m, "inner", f"{h}|{s2}", s) for s2 in dss if s2 != h]
+            if any(v is None for v in cal) or not cal:
+                continue
+            lco_keys = [k for k in SPLITS if k[0] == "lco" and k[1].split("|")[0] == h]
+            lco = [view_of(m, "lco", k[1], s) for k in lco_keys]
+            lco = lco if lco_keys and all(v is not None for v in lco) else []
+            dv = add_energy(decision_view(r, "lodo"), r)
+            idm = np.isin(r["test_idx"], SPLITS[("lodo", h)]["test_id"])
+            w_val, w_max = density_ratio(dv)
+            for score in [sc for sc in ROB_SCORES if sc in dv["U"] and all(sc in v["U"] for v in cal)]:
+                uv, ut = dv["U"][score]
+                grid = np.unique(np.concatenate([[0.0, 1.0], uv, ut] + [v["U"][score][1] for v in cal]))
+                b_val = crc_curve(uv, dv["wrong_v"], grid)
+                b_w = crc_curve(uv, dv["wrong_v"], grid, w_val, w_max)
+                b_src = [crc_curve(v["U"][score][1], v["wrong_t"], grid) for v in cal]
+                bounds = {"val-CRC": b_val, "W-CRC": b_w, "LOSO-CRC": np.mean(b_src, 0), "LOSO-CRC-worst": np.max(b_src, 0)}
+                if lco and all(score in v["U"] for v in lco):
+                    b_env = b_src + [crc_curve(v["U"][score][1], v["wrong_t"], grid) for v in lco]
+                    bounds["LOSO+LCO-CRC"], bounds["LOSO+LCO-CRC-worst"] = np.mean(b_env, 0), np.max(b_env, 0)
+                for rho in RHO_GRID:
+                    bounds[f"Robust-CRC(rho={rho})"] = kl_upper(b_val, rho)
+                pairs = [np.mean([b_src[i] for i in c], 0) for c in combinations(range(len(b_src)), 2)] if len(b_src) > 2 else []
+                for eps in EPS_GRID:
+                    for name, b in bounds.items():
+                        acc = ut <= pick(grid, b, eps)
+                        ROB_ROWS.append(dict(model=m, held_out=h, seed=s, score=score, calibration=name, eps=eps,
+                                             **gate_stats(dv, acc, idm)))
+                        if eps in (0.05, 0.10):
+                            ROB_MASKS[(m, score, name, eps, h, s)] = (acc, acc & dv["wrong_t"])
+                    if pairs:   # two calibration sources: average over the three possible pairs
+                        st = [gate_stats(dv, ut <= pick(grid, b, eps), idm) for b in pairs]
+                        ROB_ROWS.append(dict(model=m, held_out=h, seed=s, score=score, calibration="LOSO-CRC (2 src)", eps=eps,
+                                             **{k: np.nanmean([x[k] for x in st]) for k in st[0]}))
+ROB = pd.DataFrame(ROB_ROWS)
+if len(ROB):
+    ROB["violation"] = (ROB.risk > ROB.eps).astype(float)
+    ROB.to_csv(TABLES / "gate_robustness_all_runs.csv", index=False)
+print("robustness rows:", len(ROB))
+##CELL code
+# ---- 1. risk-target sweep (mean over held-out sets and seeds; equal weight per held-out set)
+CAL_ORDER = (["val-CRC", "W-CRC"] + [f"Robust-CRC(rho={r})" for r in RHO_GRID] +
+             ["LOSO-CRC (2 src)", "LOSO-CRC", "LOSO-CRC-worst", "LOSO+LCO-CRC", "LOSO+LCO-CRC-worst"])
+def per_source_mean(df, keys):
+    a = df.groupby(keys + ["held_out"])[["accept", "risk", "violation", "withheld_unseen"]].mean()
+    return a.groupby(keys).mean()
+
+if len(ROB):
+    SW = per_source_mean(ROB, ["model", "score", "calibration", "eps"]).reset_index()
+    SW.to_csv(TABLES / "gate_eps_sweep.csv", index=False)
+    for m in ROB_MODELS:
+        sub = SW[(SW.model == m) & SW.score.isin(["Remedy+kNN", "kNN"])].copy()
+        if not len(sub):
+            continue
+        sub["cell"] = [f"{r:.3f} / {a:.2f}" for r, a in zip(sub.risk, sub.accept)]
+        piv = sub.pivot_table(index=["score", "calibration"], columns="eps", values="cell", aggfunc="first")
+        piv = piv.reindex([(sc, c) for sc in ("Remedy+kNN", "kNN") for c in CAL_ORDER if (sc, c) in piv.index])
+        piv.columns = [f"eps={e:.0%}" for e in piv.columns]
+        report(f"RQ3b - risk / acceptance at several risk targets: {m} (mean over held-out sources and seeds)", md_table(piv))
+
+    # ---- 2. per held-out source at eps = 5% and 10%
+    PS = (ROB[ROB.eps.isin([0.05, 0.10]) & ROB.calibration.isin(["val-CRC", "W-CRC", "LOSO-CRC", "LOSO-CRC-worst", "LOSO+LCO-CRC", "LOSO+LCO-CRC-worst"])]
+          .groupby(["model", "score", "calibration", "eps", "held_out"])[["accept", "risk"]].mean().reset_index())
+    PS.to_csv(TABLES / "gate_per_source.csv", index=False)
+    for m in ROB_MODELS:
+        sub = PS[(PS.model == m) & (PS.score == "Remedy+kNN")].copy()
+        if not len(sub):
+            continue
+        sub["cell"] = [f"{r:.3f} / {a:.2f}" for r, a in zip(sub.risk, sub.accept)]
+        piv = sub.pivot_table(index=["eps", "calibration"], columns="held_out", values="cell", aggfunc="first")
+        report(f"RQ3b - per held-out source, Remedy+kNN, risk / acceptance: {m}", md_table(piv))
+##CELL code
+# ---- 3. bootstrap intervals (photo groups within each held-out source; seeds pooled; equal weight per source)
+def boot_gate(m, score, cal, eps, n_boot=1000, seed=0):
+    rng = np.random.default_rng(seed); per_h = []
+    for h in dss:
+        runs = [ROB_MASKS[k] for k in sorted(ROB_MASKS) if k[:5] == (m, score, cal, eps, h)]
+        if not runs:
+            continue
+        r = load_any(m, "lodo", h, [k for k in sorted(ROB_MASKS) if k[:5] == (m, score, cal, eps, h)][0][5])
+        _, ginv = np.unique(idx.group.values[r["test_idx"]], return_inverse=True)
+        members = [np.where(ginv == g)[0] for g in range(ginv.max() + 1)]
+        A = np.array([a for a, _ in runs], float); W = np.array([w for _, w in runs], float)
+        per_h.append((members, A, W))
+    if not per_h:
+        return None
+    R, Acc = np.empty(n_boot), np.empty(n_boot)
+    for b in range(n_boot):
+        rs, acs = [], []
+        for members, A, W in per_h:
+            ix = np.concatenate([members[g] for g in rng.integers(0, len(members), len(members))])
+            rs.append(W[:, ix].mean()); acs.append(A[:, ix].mean())
+        R[b], Acc[b] = np.mean(rs), np.mean(acs)
+    point_r = np.mean([W.mean() for _, _, W in per_h]); point_a = np.mean([A.mean() for _, A, _ in per_h])
+    return dict(risk=point_r, risk_lo=np.percentile(R, 2.5), risk_hi=np.percentile(R, 97.5),
+                accept=point_a, accept_lo=np.percentile(Acc, 2.5), accept_hi=np.percentile(Acc, 97.5), held_out_sets=len(per_h))
+
+CI_ROWS = []
+for m in ROB_MODELS:
+    for score in ["Remedy+kNN", "kNN", "Remedy"]:
+        for cal in ["val-CRC", "W-CRC", "LOSO-CRC", "LOSO-CRC-worst", "LOSO+LCO-CRC", "LOSO+LCO-CRC-worst"]:
+            for eps in (0.05, 0.10):
+                res = boot_gate(m, score, cal, eps, n_boot=100 if SMOKE else 1000)
+                if res:
+                    CI_ROWS.append(dict(model=m, score=score, calibration=cal, eps=eps, **res))
+CI = pd.DataFrame(CI_ROWS)
+if len(CI):
+    CI.to_csv(TABLES / "gate_bootstrap_ci.csv", index=False)
+    show = CI[CI.score == "Remedy+kNN"].copy()
+    show["risk [95% CI]"] = [f"{r:.3f} [{lo:.3f}, {hi:.3f}]" for r, lo, hi in zip(show.risk, show.risk_lo, show.risk_hi)]
+    show["accept [95% CI]"] = [f"{a:.2f} [{lo:.2f}, {hi:.2f}]" for a, lo, hi in zip(show.accept, show.accept_lo, show.accept_hi)]
+    report("RQ3b - gate risk and acceptance with 95% bootstrap intervals (Remedy+kNN)",
+           md_table(show[["model", "calibration", "eps", "risk [95% CI]", "accept [95% CI]"]].set_index("model")))
+##CELL code
+# ---- 4./5. shift-aware alternatives and fewer sources: one compact table per eps (Remedy+kNN; Energy for reference)
+if len(ROB):
+    for eps in (0.05, 0.10):
+        sub = SW[(SW.eps == eps) & SW.score.isin(["Remedy+kNN", "Energy"])].copy()
+        sub["calibration"] = pd.Categorical(sub.calibration, CAL_ORDER, ordered=True)
+        tab_ = sub.sort_values(["model", "score", "calibration"])[["model", "score", "calibration", "accept", "risk",
+                                                                   "violation", "withheld_unseen"]]
+        tab_ = tab_.rename(columns={"violation": "share_of_runs_over_eps"})
+        report(f"RQ3b - shift-aware calibrations compared at eps = {eps:.0%} (mean over held-out sources and seeds)",
+               md_table(tab_.set_index("model"), "{:.3f}"))
+
+    # figure: achieved risk vs target, and acceptance vs target (proposed model, Remedy+kNN)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    focus_m = PROPOSED if PROPOSED in ROB_MODELS else ROB_MODELS[0]
+    for cal in ["val-CRC", "W-CRC", "Robust-CRC(rho=0.1)", "LOSO-CRC (2 src)", "LOSO-CRC", "LOSO-CRC-worst", "LOSO+LCO-CRC"]:
+        d_ = SW[(SW.model == focus_m) & (SW.score == "Remedy+kNN") & (SW.calibration == cal)].sort_values("eps")
+        if len(d_):
+            axes[0].plot(d_.eps, d_.risk, "o-", label=cal); axes[1].plot(d_.eps, d_.accept, "o-", label=cal)
+    axes[0].plot([0, 0.22], [0, 0.22], "k--", lw=1, label="risk = target")
+    axes[0].set_xlabel("risk target eps"); axes[0].set_ylabel("achieved wrong-remedy risk (held-out sources)")
+    axes[1].set_xlabel("risk target eps"); axes[1].set_ylabel("acceptance")
+    axes[0].legend(fontsize=7); axes[0].set_title(f"{focus_m} / Remedy+kNN", fontsize=10)
+    plt.tight_layout(); plt.savefig(FIGS / "rq3b_eps_sweep.png", dpi=120); plt.show()
